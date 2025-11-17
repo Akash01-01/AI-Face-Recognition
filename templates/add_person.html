@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Add Person</title>
+</head>
+<body>
+    <h1>Add New Person</h1>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul>
+        {% for message in messages %}
+          <li>{{ message }}</li>
+        {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+    <form method="post" enctype="multipart/form-data">
+        <label>Name: <input type="text" name="name" required></label><br><br>
+        <label>Email: <input type="email" name="email"></label><br><br>
+        <label>Phone: <input type="tel" name="phone" placeholder="+1234567890"></label><br><br>
+        <label>Date of Birth: <input type="date" name="dob"></label><br><br>
+        <label>Images: <input type="file" name="images" multiple required accept="image/*"></label><br><br>
+        <button type="submit">Add Person</button>
+    </form>
+    <a href="/">Back to Home</a>
+</body>
+</html>

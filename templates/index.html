@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Recognition App</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f5f5f5; }
+        .container { display: flex; gap: 12px; padding: 12px; max-width: 1200px; margin: 0 auto; }
+        #video { border: 1px solid #ccc; max-width: 640px; border-radius: 8px; }
+        #info-panel { width: 300px; border: 1px solid #ddd; padding: 12px; background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #info-panel img { width: 100%; height: auto; border-radius: 6px; }
+        #status { margin-top: 8px; font-weight: bold; }
+        #details { margin-top: 8px; }
+        .unknown { color: #c00; }
+        .known { color: #080; }
+        .btn { padding: 10px 32px; font-size: 1.1em; width: 100%; border: none; border-radius: 4px; cursor: pointer; transition: background 0.3s; }
+        .btn-primary { background: #007bff; color: white; }
+        .btn-primary:hover { background: #0056b3; }
+        .btn-primary:disabled { background: #6c757d; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <h1 style="padding: 12px; text-align: center; color: #333; margin: 0;">Face Recognition System</h1>
+    <div class="container">
+        <div style="position: relative;">
+            <video id="video" width="640" height="480" autoplay muted playsinline></video>
+            <canvas id="overlay" width="640" height="480" style="position: absolute; top: 0; left: 0; pointer-events: none;"></canvas>
+            <div id="feedback" style="padding-top: 8px; color: #555; text-align: center;">Position your face in the center. Green box means good positioning for capture.</div>
+        </div>
+        <div id="info-panel">
+            <div id="status">Waiting...</div>
+            <div id="face-img" style="margin-top: 8px;"></div>
+            <div id="details"></div>
+            <div style="margin-top: 12px;"><a href="/add_person" style="color: #007bff; text-decoration: none;">Add New Person (Upload Images & Data)</a></div>
+            <button id="capture-btn-main" class="btn btn-primary" style="margin-top: 16px;">Capture</button>
+        </div>
+    </div>
+    <script>
+        // Optimized JavaScript for production
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const overlayCtx = overlay.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const detailsEl = document.getElementById('details');
+        const faceImgEl = document.getElementById('face-img');
+
+        let processing = false;
+        let cooldownUntil = 0;
+        let goodPositioning = false;
+
+        // Initialize camera
+        navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
+            .then(stream => {
+                video.srcObject = stream;
+                video.play();
+                startFaceDetection();
+            })
+            .catch(err => {
+                statusEl.innerText = 'Camera access error: ' + err.message;
+            });
+
+        // Optimized face detection
+        function startFaceDetection() {
+            function detectFaces() {
+                if (video.readyState < 2) {
+                    requestAnimationFrame(detectFaces);
+                    return;
+                }
+
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth || 640;
+                canvas.height = video.videoHeight || 480;
+                canvas.getContext('2d').drawImage(video, 0, 0);
+
+                overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+                try {
+                    const imageData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+                    const boxWidth = 300;
+                    const boxHeight = 400;
+                    const boxX = (overlay.width - boxWidth) / 2;
+                    const boxY = (overlay.height - boxHeight) / 2;
+
+                    const centerX = canvas.width / 2;
+                    const centerY = canvas.height / 2;
+                    // Simplified face positioning check
+                    const regions = [
+                        { x: centerX - 60, y: centerY - 120, w: 120, h: 40 },
+                        { x: centerX - 80, y: centerY - 60, w: 160, h: 40 },
+                        { x: centerX - 30, y: centerY - 20, w: 60, h: 40 },
+                        { x: centerX - 40, y: centerY + 20, w: 80, h: 30 }
+                    ];
+
+                    let validRegions = 0;
+                    regions.forEach(region => {
+                        let skinPixels = 0;
+                        let regionPixels = 0;
+                        
+                        for (let y = region.y; y < region.y + region.h; y++) {
+                            for (let x = region.x; x < region.x + region.w; x++) {
+                                if (x >= 0 && x < canvas.width && y >= 0 && y < canvas.height) {
+                                    const idx = (y * canvas.width + x) * 4;
+                                    const r = imageData.data[idx];
+                                    const g = imageData.data[idx + 1];
+                                    const b = imageData.data[idx + 2];
+                                    
+                                    if (detectSkinColor(r, g, b)) skinPixels++;
+                                    regionPixels++;
+                                }
+                            }
+                        }
+                        
+                        if (regionPixels > 0 && skinPixels / regionPixels > 0.25) {
+                            validRegions++;
+                        }
+                    });
+
+                    goodPositioning = validRegions >= 3;
+                    overlayCtx.strokeStyle = goodPositioning ? '#00ff00' : '#ff0000';
+                    overlayCtx.lineWidth = 3;
+                    overlayCtx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+
+                    const feedbackEl = document.getElementById('feedback');
+                    if (goodPositioning) {
+                        feedbackEl.style.color = '#00aa00';
+                        feedbackEl.textContent = '✓ Good positioning! Ready to capture';
+                    } else {
+                        feedbackEl.style.color = '#aa0000';
+                        feedbackEl.textContent = '⚠ Position your face in the green box';
+                    }
+
+                } catch (error) {
+                    console.log('Face detection error:', error);
+                }
+
+                requestAnimationFrame(detectFaces);
+            }
+            detectFaces();
+        }
+
+        function detectSkinColor(r, g, b) {
+            return r > 95 && g > 40 && b > 20 && 
+                   Math.max(r, Math.max(g, b)) - Math.min(r, Math.min(g, b)) > 15 &&
+                   Math.abs(r - g) > 15 && r > g && r > b;
+        }
+
+        function captureAndSend() {
+            if (processing) return;
+            if (Date.now() < cooldownUntil) return;
+            if (video.readyState < 2) return; // not enough data
+
+            processing = true;
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth || 640;
+            canvas.height = video.videoHeight || 480;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+
+            canvas.toBlob(blob => {
+                const formData = new FormData();
+                formData.append('image', blob, 'capture.jpg');
+                statusEl.innerText = 'Processing...';
+                fetch('/identify', { method: 'POST', body: formData })
+                    .then(res => res.text())
+                    .then(text => {
+                        try {
+                            const data = JSON.parse(text);
+                            handleIdentifyResult(data);
+                        } catch (e) {
+                            statusEl.innerText = 'Server error: Invalid response format';
+                            detailsEl.innerHTML = '<span style="color: #cc0000;">Please try again or contact support.</span>';
+                        }
+                    })
+                    .catch(err => {
+                        statusEl.innerText = 'Error: ' + err.message;
+                        detailsEl.innerHTML = '<span style="color: #cc0000;">Connection error. Please check your internet.</span>';
+                    })
+                    .finally(() => {
+                        processing = false;
+                    });
+            }, 'image/jpeg');
+        }
+
+        // --- Unknown registration modal logic (DISABLED - no longer needed) ---
+        // Modal functionality has been disabled as unknown person registration is no longer required
+        function showUnknownModal() {
+            // Do nothing - registration is disabled
+        }
+        function hideUnknownModal() {
+            // Do nothing - registration is disabled
+        }
+        
+        // When unknown detected, no longer trigger registration
+        function triggerUnknownRegistration() {
+            // Do nothing - registration is disabled
+        }
+
+        // Patch into face recognition result
+        function handleIdentifyResult(data) {
+            if (data.recognized) {
+                statusEl.innerHTML = '<span class="known">Identified: ' + (data.name || 'Unknown') + '</span>';
+                detailsEl.innerHTML = '<strong>Name:</strong> ' + (data.name || 'Unknown') + '<br>' +
+                                      '<strong>Email:</strong> ' + (data.email || 'No email') + '<br>' +
+                                      '<strong>Phone:</strong> ' + (data.phone || 'No phone') + '<br>' +
+                                      '<strong>DOB:</strong> ' + (data.dob || 'No DOB') + '<br>' +
+                                      '<strong>Confidence:</strong> ' + (data.confidence ? data.confidence.toFixed(2) : 'N/A') + '<br><br>' +
+                                      '<span style="color: #00aa00; font-weight: bold;">Detection successful.</span>';
+                cooldownUntil = Date.now() + 10000;
+            } else if (data.face_image) {
+                statusEl.innerHTML = '<span class="unknown">Unknown person</span>';
+                detailsEl.innerHTML = '<span style="color: #cc0000; font-weight: bold;">Detection unsuccessful.</span>';
+                cooldownUntil = Date.now() + 8000;
+                // No longer show registration modal for unknown persons
+            } else {
+                statusEl.innerText = data.message || 'No face';
+                detailsEl.innerText = '';
+            }
+            if (data.face_image) {
+                faceImgEl.innerHTML = '';
+                faceImgEl.innerHTML = '<img src="data:image/jpeg;base64,' + data.face_image + '" alt="face">';
+            } else {
+                faceImgEl.innerHTML = '';
+            }
+        }
+
+        // --- Manual Capture Button ---
+        const captureBtnMain = document.getElementById('capture-btn-main');
+        let captureReady = true;
+        captureBtnMain.disabled = false;
+        captureBtnMain.addEventListener('click', function() {
+            if (!captureReady || processing) return;
+            if (video.readyState < 2) return;
+            if (!goodPositioning) {
+                statusEl.innerText = 'Please position your face properly in the green box first!';
+                statusEl.style.color = '#ff0000';
+                setTimeout(() => {
+                    statusEl.innerText = 'Waiting...';
+                    statusEl.style.color = '';
+                }, 3000);
+                return;
+            }
+            captureReady = false;
+            captureBtnMain.disabled = true;
+            captureBtnMain.textContent = 'Processing...';
+            captureBtnMain.style.background = '#6c757d';
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth || 640;
+            canvas.height = video.videoHeight || 480;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            canvas.toBlob(blob => {
+                const formData = new FormData();
+                formData.append('image', blob, 'capture.jpg');
+                statusEl.innerText = 'Processing capture...';
+                fetch('/identify', { method: 'POST', body: formData })
+                    .then(res => res.text())
+                    .then(text => {
+                        try {
+                            const data = JSON.parse(text);
+                            handleIdentifyResult(data);
+                        } catch (e) {
+                            statusEl.innerText = 'Server error: Invalid response format';
+                            detailsEl.innerHTML = '<span style="color: #cc0000;">Please try again or contact support.</span>';
+                        }
+                        setTimeout(() => {
+                            captureReady = true;
+                            captureBtnMain.disabled = false;
+                            captureBtnMain.textContent = 'Capture';
+                            captureBtnMain.style.background = '#007bff';
+                        }, 10000); // 10 seconds cooldown
+                    })
+                    .catch(err => {
+                        statusEl.innerText = 'Error: ' + err.message;
+                        detailsEl.innerHTML = '<span style="color: #cc0000;">Connection error. Please check your internet.</span>';
+                        setTimeout(() => {
+                            captureReady = true;
+                            captureBtnMain.disabled = false;
+                            captureBtnMain.textContent = 'Capture';
+                            captureBtnMain.style.background = '#007bff';
+                        }, 3000);
+                    });
+            }, 'image/jpeg');
+        });
+    </script>
+</body>
+</html>
