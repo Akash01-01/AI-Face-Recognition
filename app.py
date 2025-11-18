@@ -25,7 +25,18 @@ db = SQLAlchemy(app)
 # Cache for face recognizer
 face_recognizer = None
 label_to_emp = {}
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Initialize face cascade with production error handling
+try:
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    if face_cascade.empty():
+        print("ERROR: Face cascade failed to load!")
+        face_cascade = None
+    else:
+        print("✓ Face cascade loaded successfully")
+except Exception as e:
+    print(f"ERROR loading face cascade: {e}")
+    face_cascade = None
 
 
 
@@ -115,6 +126,10 @@ def train_face_recognizer():
                 img = cv2.imdecode(npbuf, cv2.IMREAD_GRAYSCALE)
                 if img is None:
                     continue
+                # Skip if cascade not available
+                if face_cascade is None:
+                    print("Skipping face detection in training - cascade not available")
+                    continue
                 detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.3, minNeighbors=2, minSize=(30, 30))
                 if len(detected_faces) > 0:
                     # Use only the largest face
@@ -169,13 +184,26 @@ def validate_confidence(confidence):
 with app.app_context():
     db.create_all()
     try:
+        # Check OpenCV availability first
+        print("Checking OpenCV face recognition...")
+        test_recognizer = cv2.face.LBPHFaceRecognizer_create()
+        print("✓ OpenCV face recognition available")
+        
         emp_count = EmpMaster.query.count()
-        if emp_count > 0:
+        img_count = EmployeeImage.query.count()
+        print(f"Found {emp_count} employees and {img_count} images in database")
+        
+        if emp_count > 0 and face_cascade is not None:
+            print("Training face recognizer...")
             face_recognizer, label_to_emp = train_face_recognizer()
+            print(f"✓ Trained with {len(label_to_emp)} employees")
         else:
             face_recognizer = cv2.face.LBPHFaceRecognizer_create()
             label_to_emp = {}
+            if face_cascade is None:
+                print("⚠ Face cascade not available - face detection disabled")
     except Exception as e:
+        print(f"Initialization error: {e}")
         face_recognizer = cv2.face.LBPHFaceRecognizer_create()
         label_to_emp = {}
 
@@ -347,6 +375,16 @@ def identify():
             frame = cv2.resize(frame, (new_width, 400))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Check if face cascade is available
+        if face_cascade is None:
+            print("ERROR: Face cascade not available in production")
+            return jsonify({
+                'recognized': False,
+                'message': 'Face detection service unavailable',
+                'debug': 'OpenCV cascade not loaded'
+            })
+        
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=3, minSize=(50, 50))
         if len(faces) == 0:
             return jsonify({'message': 'No face detected.', 'recognized': False})
