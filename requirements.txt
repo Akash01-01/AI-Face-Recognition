@@ -1,6 +1,4 @@
 
-python_version == 3.13.5
-
 blinker==1.9.0
 click==8.3.0
 cmake==4.1.2
