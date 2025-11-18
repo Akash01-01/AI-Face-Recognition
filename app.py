@@ -185,6 +185,23 @@ with app.app_context():
 def index():
     return render_template('index.html')
 
+@app.route('/debug')
+def debug_info():
+    """Debug endpoint to check production status"""
+    try:
+        emp_count = EmpMaster.query.count()
+        img_count = EmployeeImage.query.count()
+        return jsonify({
+            'employees_in_db': emp_count,
+            'images_in_db': img_count,
+            'face_recognizer_loaded': face_recognizer is not None,
+            'trained_labels': len(label_to_emp),
+            'label_mapping': label_to_emp,
+            'face_cascade_loaded': not face_cascade.empty() if face_cascade else False
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
 
 # Add new employee and images
 @app.route('/add_person', methods=['GET', 'POST'])
@@ -289,6 +306,25 @@ def add_person():
         reload_faces()
         flash('Employee added successfully!')
         return redirect(url_for('add_person'))
+
+@app.route('/retrain')
+def force_retrain():
+    """Force retrain face recognizer for production"""
+    global face_recognizer, label_to_emp
+    try:
+        old_count = len(label_to_emp)
+        face_recognizer, label_to_emp = train_face_recognizer()
+        return jsonify({
+            'success': True,
+            'message': f'Retrained: {old_count} -> {len(label_to_emp)} employees',
+            'trained_employees': len(label_to_emp),
+            'label_mapping': label_to_emp
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        })
     return render_template('add_person.html')
 
 @app.route('/identify', methods=['POST'])
@@ -318,7 +354,8 @@ def identify():
         if not label_to_emp:
             return jsonify({
                 'recognized': False,
-                'message': 'No employees registered yet.'
+                'message': 'No employees registered yet.',
+                'debug': f'label_to_emp empty, face_recognizer: {face_recognizer is not None}'
             })
 
         # Use only the largest face for maximum speed
@@ -330,8 +367,12 @@ def identify():
         # Single prediction only - no validation needed
         label, confidence = face_recognizer.predict(face_img)
         
+        # Debug info for production
+        print(f'DEBUG: Prediction - Label: {label}, Confidence: {confidence}')
+        print(f'DEBUG: Available employees in label_to_emp: {list(label_to_emp.keys())}')
+        
         best_face_crop = None
-        if confidence < 35:  # Strict threshold
+        if confidence < 50:  # More lenient threshold for production
             # Quick face crop
             try:
                 padding = 20
@@ -343,8 +384,9 @@ def identify():
             except Exception:
                 pass
 
-        if confidence < 35:  # Very strict
+        if confidence < 50:  # More lenient for production
             emp_id = label_to_emp.get(label, None)
+            print(f'DEBUG: Found emp_id: {emp_id} for label: {label}')
             if emp_id:
                 emp_info = get_employee_info(emp_id)
                 
