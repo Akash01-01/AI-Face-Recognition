@@ -1,8 +1,36 @@
 import os
 from datetime import datetime
 from flask_cors import CORS
-import cv2
-import numpy as np
+try:
+    import cv2
+    import numpy as np
+    OPENCV_AVAILABLE = True
+    print("✓ OpenCV imported successfully")
+except ImportError as e:
+    print(f"✗ OpenCV import failed: {e}")
+    OPENCV_AVAILABLE = False
+    # Create mock objects to prevent import errors
+    class MockCV2:
+        @staticmethod
+        def CascadeClassifier(*args): return None
+        @staticmethod
+        def cvtColor(*args): return None
+        @staticmethod
+        def detectMultiScale(*args): return []
+        @staticmethod
+        def resize(*args): return None
+        @staticmethod
+        def imdecode(*args): return None
+        @staticmethod
+        def imencode(*args): return (True, b'')
+        face = type('face', (), {'LBPHFaceRecognizer_create': lambda: None})()
+        data = type('data', (), {'haarcascades': ''})()
+        IMREAD_COLOR = 1
+        IMREAD_GRAYSCALE = 0
+        COLOR_BGR2GRAY = 7
+        IMWRITE_JPEG_QUALITY = 1
+    cv2 = MockCV2()
+    import numpy as np
 import base64
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
@@ -27,15 +55,19 @@ face_recognizer = None
 label_to_emp = {}
 
 # Initialize face cascade with production error handling
-try:
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    if face_cascade.empty():
-        print("ERROR: Face cascade failed to load!")
+if OPENCV_AVAILABLE:
+    try:
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        if face_cascade.empty():
+            print("ERROR: Face cascade failed to load!")
+            face_cascade = None
+        else:
+            print("✓ Face cascade loaded successfully")
+    except Exception as e:
+        print(f"ERROR loading face cascade: {e}")
         face_cascade = None
-    else:
-        print("✓ Face cascade loaded successfully")
-except Exception as e:
-    print(f"ERROR loading face cascade: {e}")
+else:
+    print("OpenCV not available - face detection disabled")
     face_cascade = None
 
 
@@ -376,13 +408,12 @@ def identify():
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Check if face cascade is available
-        if face_cascade is None:
-            print("ERROR: Face cascade not available in production")
+        # Check if OpenCV and face cascade are available
+        if not OPENCV_AVAILABLE or face_cascade is None:
             return jsonify({
                 'recognized': False,
                 'message': 'Face detection service unavailable',
-                'debug': 'OpenCV cascade not loaded'
+                'debug': f'OpenCV available: {OPENCV_AVAILABLE}, Cascade loaded: {face_cascade is not None}'
             })
         
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=3, minSize=(50, 50))
