@@ -5,7 +5,7 @@
     <title>Add Person</title>
 </head>
 <body>
-    <h1>Add New Person</h1>
+    <h1>Add New Employee</h1>
     {% with messages = get_flashed_messages() %}
       {% if messages %}
         <ul>
@@ -16,12 +16,38 @@
       {% endif %}
     {% endwith %}
     <form method="post" enctype="multipart/form-data">
-        <label>Name: <input type="text" name="name" required></label><br><br>
-        <label>Email: <input type="email" name="email"></label><br><br>
-        <label>Phone: <input type="tel" name="phone" placeholder="+1234567890"></label><br><br>
+        <label>Employee ID: <input type="text" name="emp_id" required></label><br><br>
+        <label>Full Name: <input type="text" name="full_name"></label><br><br>
         <label>Date of Birth: <input type="date" name="dob"></label><br><br>
+        <label>Gender: <select name="gender"><option value="">Select</option><option value="Male">Male</option><option value="Female">Female</option><option value="Other">Other</option></select></label><br><br>
+        <label>Email: <input type="email" name="email"></label><br><br>
+        <label>Contact: <input type="tel" name="contact" placeholder="+1234567890"></label><br><br>
+        <label>Present Address: <input type="text" name="present_addr"></label><br><br>
+        <label>Permanent Address: <input type="text" name="perm_addr"></label><br><br>
+        <label>Join Date: <input type="date" name="join_date"></label><br><br>
+        <label>End Date: <input type="date" name="end_date"></label><br><br>
+        <label>Employee Type: <input type="text" name="emp_type"></label><br><br>
+        <label>Check In Time: <input type="time" name="check_in"></label><br><br>
+        <label>Check Out Time: <input type="time" name="check_out"></label><br><br>
+        <label>Longitude: <input type="number" step="0.00000001" name="longitude"></label><br><br>
+        <label>Latitude: <input type="number" step="0.00000001" name="latitude"></label><br><br>
+        <label>Department: <input type="text" name="dept"></label><br><br>
+        <label>Designation: <input type="text" name="desig"></label><br><br>
+        <label>Salary Type: <input type="text" name="salary_type"></label><br><br>
+        <label>Salary Amount: <input type="text" name="salary_amt" required></label><br><br>
+        <label>Full Absence Fine: <input type="number" step="0.01" name="full_abs_fine"></label><br><br>
+        <label>Half Absence Fine: <input type="number" step="0.01" name="half_abd_fine"></label><br><br>
+        <label>Yearly Leaves: <input type="number" name="yearly_leaves"></label><br><br>
+        <label>Bank: <input type="text" name="bank"></label><br><br>
+        <label>Bank Name: <input type="text" name="bank_name"></label><br><br>
+        <label>Branch Name: <input type="text" name="branch_name"></label><br><br>
+        <label>Account Name: <input type="text" name="account_name" required></label><br><br>
+        <label>Account Number: <input type="text" name="account_no"></label><br><br>
+        <label>IFSC Code: <input type="text" name="ifsc_code"></label><br><br>
+        <label>Entered By: <input type="text" name="entried_by"></label><br><br>
+        <label>Total Yearly Leaves: <input type="text" name="total_yearly_leaves" required></label><br><br>
         <label>Images: <input type="file" name="images" multiple required accept="image/*"></label><br><br>
-        <button type="submit">Add Person</button>
+        <button type="submit">Add Employee</button>
     </form>
     <a href="/">Back to Home</a>
 </body>

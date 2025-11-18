@@ -203,7 +203,12 @@
                                       '<strong>DOB:</strong> ' + (data.dob || 'No DOB') + '<br>' +
                                       '<strong>Confidence:</strong> ' + (data.confidence ? data.confidence.toFixed(2) : 'N/A') + '<br><br>' +
                                       '<span style="color: #00aa00; font-weight: bold;">Detection successful.</span>';
-                cooldownUntil = Date.now() + 4000;
+                // Voice feedback
+                if ('speechSynthesis' in window) {
+                    const utter = new SpeechSynthesisUtterance('Thank you');
+                    window.speechSynthesis.speak(utter);
+                }
+                cooldownUntil = Date.now() + 1000; // 1 second cooldown
             } else {
                 statusEl.innerText = data.message || 'No face';
                 detailsEl.innerText = '';
@@ -250,22 +255,24 @@
                             statusEl.innerText = 'Server error: Invalid response format';
                             detailsEl.innerHTML = '<span style="color: #cc0000;">Please try again or contact support.</span>';
                         }
+                        // Quick button re-enable for better UX
                         setTimeout(() => {
                             captureReady = true;
                             captureBtnMain.disabled = false;
                             captureBtnMain.textContent = 'Capture';
                             captureBtnMain.style.background = '#007bff';
-                        }, 4000); // 4 seconds cooldown
+                        }, 1000); // 1 second only
                     })
                     .catch(err => {
                         statusEl.innerText = 'Error: ' + err.message;
                         detailsEl.innerHTML = '<span style="color: #cc0000;">Connection error. Please check your internet.</span>';
+                        // Quick re-enable on error too
                         setTimeout(() => {
                             captureReady = true;
                             captureBtnMain.disabled = false;
                             captureBtnMain.textContent = 'Capture';
                             captureBtnMain.style.background = '#007bff';
-                        }, 3000);
+                        }, 1000); // 1 second for errors too
                     });
             }, 'image/jpeg');
         });

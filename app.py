@@ -24,49 +24,89 @@ db = SQLAlchemy(app)
 
 # Cache for face recognizer
 face_recognizer = None
-label_to_name = {}
+label_to_emp = {}
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 
-# Person model
-class Person(db.Model):
+
+# New models for employee and attendance
+
+class EmpMaster(db.Model):
+    __tablename__ = 'emp_master'
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(80), nullable=False)
-    email = db.Column(db.String(120), nullable=True)
-    phone = db.Column(db.String(20), nullable=True)
-    dob = db.Column(db.Date, nullable=True)
-    folder = db.Column(db.String(120), nullable=False)
-    # Images are stored in the database; folder kept for backward-compatibility
-    images = db.relationship('PersonImage', backref='person', lazy=True, cascade='all, delete-orphan')
+    emp_id = db.Column(db.String(255), nullable=False)
+    full_name = db.Column(db.String(255), default=None)
+    dob = db.Column(db.Date, default=None)
+    gender = db.Column(db.String(10), default=None)
+    email = db.Column(db.String(255), default=None)
+    contact = db.Column(db.String(20), default=None)
+    present_addr = db.Column(db.Text, default=None)
+    perm_addr = db.Column(db.Text, default=None)
+    join_date = db.Column(db.Date, default=None)
+    end_date = db.Column(db.Date, default=None)
+    emp_type = db.Column(db.String(50), default=None)
+    check_in = db.Column(db.Time, default=None)
+    check_out = db.Column(db.Time, default=None)
+    longitude = db.Column(db.Numeric(10,8), default=None)
+    latitude = db.Column(db.Numeric(11,8), default=None)
+    dept = db.Column(db.String(255), default=None)
+    desig = db.Column(db.String(255), default=None)
+    salary_type = db.Column(db.String(50), default=None)
+    salary_amt = db.Column(db.String(255), nullable=False)
+    full_abs_fine = db.Column(db.Numeric(10,2), default=None)
+    half_abd_fine = db.Column(db.Numeric(10,2), default=None)
+    yearly_leaves = db.Column(db.Integer, default=None)
+    bank = db.Column(db.String(255), default=None)
+    bank_name = db.Column(db.String(255), default=None)
+    branch_name = db.Column(db.String(255), default=None)
+    account_name = db.Column(db.String(255), nullable=False)
+    account_no = db.Column(db.String(50), default=None)
+    ifsc_code = db.Column(db.String(20), default=None)
+    entried_by = db.Column(db.String(255), default=None)
+    created_date = db.Column(db.TIMESTAMP, server_default=db.func.current_timestamp())
+    total_yearly_leaves = db.Column(db.String(250), nullable=False)
 
-
-class PersonImage(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    person_id = db.Column(db.Integer, db.ForeignKey('person.id'), nullable=False)
+class EmployeeImage(db.Model):
+    __tablename__ = 'employee_images'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    emp_id = db.Column(db.String(255), nullable=False)
+    image_data = db.Column(db.LargeBinary(length=16777216), nullable=False)
     filename = db.Column(db.String(255), nullable=True)
-    image_data = db.Column(db.LargeBinary(length=16777216), nullable=False)  # up to 16MB
-    created_at = db.Column(db.DateTime, nullable=False, server_default=db.func.now())
+    uploaded_at = db.Column(db.TIMESTAMP, server_default=db.func.current_timestamp())
 
-# Note: We no longer persist captured images. Images for training
-# must be added manually under 'known_person/<PersonName>/' and
-# metadata in the database via the Add Person form.
 
-# Optimized face recognizer training
+class AttendanceMaster(db.Model):
+    __tablename__ = 'attendance_master'
+    id = db.Column(db.Integer, primary_key=True)
+    emp_id = db.Column(db.Integer, nullable=False)
+    full_name = db.Column(db.String(255), nullable=False)
+    check_in = db.Column(db.Time, nullable=False)
+    check_out = db.Column(db.Time, default=None)
+    worked_hours = db.Column(db.Numeric(5,2), default=None)
+    worked_day = db.Column(db.String(20), default=None)
+    att_date = db.Column(db.Date, nullable=False)
+    longitude = db.Column(db.String(255), nullable=False)
+    latitude = db.Column(db.String(255), nullable=False)
+    is_paid = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.TIMESTAMP, server_default=db.func.current_timestamp())
+    attendance_status = db.Column(db.String(250), nullable=False)
+
+# Face images are now stored directly in the database via the Add Employee form.
+
+
+# Train recognizer using new employee tables
 def train_face_recognizer():
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     faces = []
     labels = []
-    label_to_name = {}
-    people = Person.query.all()
-    
-    if not people:
-        return recognizer, label_to_name
-        
+    label_to_emp = {}
+    employees = EmpMaster.query.all()
+    if not employees:
+        return recognizer, label_to_emp
     label = 0
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    
-    for person in people:
-        person_faces_count = 0
-        imgs = PersonImage.query.filter_by(person_id=person.id).all()
+    for emp in employees:
+        emp_faces_count = 0
+        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(2).all()  # Limit to 2 images per employee
         if not imgs:
             continue
         for img_row in imgs:
@@ -75,113 +115,69 @@ def train_face_recognizer():
                 img = cv2.imdecode(npbuf, cv2.IMREAD_GRAYSCALE)
                 if img is None:
                     continue
-                detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
-                if len(detected_faces) == 0:
-                    # Fallback detection
-                    detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.2, minNeighbors=2, minSize=(20, 20))
-                for (x, y, w, h) in detected_faces:
+                detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.3, minNeighbors=2, minSize=(30, 30))
+                if len(detected_faces) > 0:
+                    # Use only the largest face
+                    x, y, w, h = max(detected_faces, key=lambda f: f[2] * f[3])
                     face_roi = img[y:y+h, x:x+w]
-                    face_roi = cv2.equalizeHist(face_roi)
-                    face_roi = cv2.resize(face_roi, (200, 200))
-                    face_roi = cv2.normalize(face_roi, None, 0, 255, cv2.NORM_MINMAX)
-                    sharpness = cv2.Laplacian(face_roi, cv2.CV_64F).var()
-                    if sharpness > 10:
-                        faces.append(face_roi)
-                        labels.append(label)
-                        person_faces_count += 1
+                    face_roi = cv2.resize(face_roi, (80, 80))  # Even smaller for speed
+                    faces.append(face_roi)
+                    labels.append(label)
+                    emp_faces_count += 1
             except Exception:
                 continue
-        if person_faces_count > 0:
-            label_to_name[label] = person.name
+        if emp_faces_count > 0:
+            label_to_emp[label] = emp.emp_id  # Store string emp_id
             label += 1
-    
     if faces and labels:
         recognizer.train(faces, np.array(labels))
-    return recognizer, label_to_name
+    return recognizer, label_to_emp
 
-# Optimized helper functions
-def get_person_info(name):
-    person = Person.query.filter_by(name=name).first()
-    if person:
+
+# Helper to get employee info
+def get_employee_info(emp_id):
+    emp = EmpMaster.query.filter_by(emp_id=emp_id).first()
+    if emp:
+        # Handle date properly - check if it's a date object and not empty string
+        dob_str = 'No DOB'
+        if emp.dob and hasattr(emp.dob, 'strftime'):
+            dob_str = emp.dob.strftime('%Y-%m-%d')
+        elif emp.dob and isinstance(emp.dob, str) and emp.dob.strip():
+            dob_str = emp.dob
+            
         return {
-            'name': person.name, 
-            'email': person.email or 'No email',
-            'phone': getattr(person, 'phone', None) or 'No phone',
-            'dob': person.dob.strftime('%Y-%m-%d') if hasattr(person, 'dob') and person.dob else 'No DOB'
+            'emp_id': emp.emp_id,
+            'id': emp.id,  # Integer ID for attendance table
+            'name': emp.full_name or emp.emp_id,
+            'email': emp.email or 'No email',
+            'phone': emp.contact or 'No phone',
+            'dob': dob_str
         }
-    return {'name': name, 'email': 'No email', 'phone': 'No phone', 'dob': 'No DOB'}
+    return {'emp_id': emp_id, 'id': None, 'name': 'Unknown', 'email': 'No email', 'phone': 'No phone', 'dob': 'No DOB'}
+
 
 def reload_faces():
-    global face_recognizer, label_to_name
-    face_recognizer, label_to_name = train_face_recognizer()
+    global face_recognizer, label_to_emp
+    face_recognizer, label_to_emp = train_face_recognizer()
 
-def validate_against_stored_images(captured_face, person_name, confidence):
-    try:
-        person = Person.query.filter_by(name=person_name).first()
-        if not person:
-            return False
-        imgs = PersonImage.query.filter_by(person_id=person.id).all()
-        if not imgs:
-            return False
-        
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        similar_matches = 0
-        total_comparisons = 0
-        
-        for img_row in imgs:
-            npbuf = np.frombuffer(img_row.image_data, dtype=np.uint8)
-            stored_img = cv2.imdecode(npbuf, cv2.IMREAD_GRAYSCALE)
-            if stored_img is None:
-                continue
-            stored_faces = face_cascade.detectMultiScale(stored_img, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
-            
-            for (x, y, w, h) in stored_faces:
-                stored_face = stored_img[y:y+h, x:x+w]
-                stored_face = cv2.equalizeHist(stored_face)
-                stored_face = cv2.resize(stored_face, (200, 200))
-                stored_face = cv2.normalize(stored_face, None, 0, 255, cv2.NORM_MINMAX)
-                
-                # Multiple similarity calculations
-                similarities = []
-                result1 = cv2.matchTemplate(captured_face, stored_face, cv2.TM_CCOEFF_NORMED)
-                _, max_val1, _, _ = cv2.minMaxLoc(result1)
-                similarities.append(max_val1)
-                
-                result2 = cv2.matchTemplate(captured_face, stored_face, cv2.TM_CCORR_NORMED)
-                _, max_val2, _, _ = cv2.minMaxLoc(result2)
-                similarities.append(max_val2)
-                
-                diff = cv2.absdiff(captured_face, stored_face)
-                structural_sim = 1.0 - (np.mean(diff) / 255.0)
-                similarities.append(structural_sim)
-                
-                avg_similarity = np.mean(similarities)
-                total_comparisons += 1
-                
-                if avg_similarity > 0.55:
-                    similar_matches += 1
-        
-        if total_comparisons > 0:
-            similarity_ratio = similar_matches / total_comparisons
-            return similarity_ratio >= 0.3 and confidence < 95
-        return False
-        
-    except Exception:
-        return False
+
+# Fast validation - just check confidence threshold
+def validate_confidence(confidence):
+    return confidence < 35  # Very strict confidence check only
 
 # Initialize application
 with app.app_context():
     db.create_all()
     try:
-        people_count = Person.query.count()
-        if people_count > 0:
-            face_recognizer, label_to_name = train_face_recognizer()
+        emp_count = EmpMaster.query.count()
+        if emp_count > 0:
+            face_recognizer, label_to_emp = train_face_recognizer()
         else:
             face_recognizer = cv2.face.LBPHFaceRecognizer_create()
-            label_to_name = {}
+            label_to_emp = {}
     except Exception as e:
         face_recognizer = cv2.face.LBPHFaceRecognizer_create()
-        label_to_name = {}
+        label_to_emp = {}
 
 
 # Routes
@@ -189,39 +185,92 @@ with app.app_context():
 def index():
     return render_template('index.html')
 
+
+# Add new employee and images
 @app.route('/add_person', methods=['GET', 'POST'])
 def add_person():
     if request.method == 'POST':
-        name = request.form['name']
-        email = request.form['email']
-        phone = request.form['phone']
-        dob = request.form['dob']
-        folder = name  # keep for compatibility
-
-        # Upsert person record
-        person = Person.query.filter_by(name=name).first()
-        if not person:
-            dob_date = None
-            if dob:
+        # Collect all fields from the form
+        emp_data = {
+            'emp_id': request.form.get('emp_id'),
+            'full_name': request.form.get('full_name'),
+            'dob': request.form.get('dob'),
+            'gender': request.form.get('gender'),
+            'email': request.form.get('email'),
+            'contact': request.form.get('contact'),
+            'present_addr': request.form.get('present_addr'),
+            'perm_addr': request.form.get('perm_addr'),
+            'join_date': request.form.get('join_date'),
+            'end_date': request.form.get('end_date'),
+            'emp_type': request.form.get('emp_type'),
+            'check_in': request.form.get('check_in'),
+            'check_out': request.form.get('check_out'),
+            'longitude': request.form.get('longitude'),
+            'latitude': request.form.get('latitude'),
+            'dept': request.form.get('dept'),
+            'desig': request.form.get('desig'),
+            'salary_type': request.form.get('salary_type'),
+            'salary_amt': request.form.get('salary_amt'),
+            'full_abs_fine': request.form.get('full_abs_fine'),
+            'half_abd_fine': request.form.get('half_abd_fine'),
+            'yearly_leaves': request.form.get('yearly_leaves'),
+            'bank': request.form.get('bank'),
+            'bank_name': request.form.get('bank_name'),
+            'branch_name': request.form.get('branch_name'),
+            'account_name': request.form.get('account_name'),
+            'account_no': request.form.get('account_no'),
+            'ifsc_code': request.form.get('ifsc_code'),
+            'entried_by': request.form.get('entried_by'),
+            'total_yearly_leaves': request.form.get('total_yearly_leaves'),
+        }
+        # Convert date/time/number fields
+        for date_field in ['dob', 'join_date', 'end_date']:
+            if emp_data[date_field] and emp_data[date_field].strip():
                 try:
-                    dob_date = datetime.strptime(dob, '%Y-%m-%d').date()
-                except ValueError:
-                    flash(f'Invalid date format. Please use YYYY-MM-DD format.')
-                    return redirect(url_for('add_person'))
-            person = Person(name=name, email=email, phone=phone, dob=dob_date, folder=folder)
-            db.session.add(person)
+                    emp_data[date_field] = datetime.strptime(emp_data[date_field], '%Y-%m-%d').date()
+                except Exception:
+                    emp_data[date_field] = None
+            else:
+                emp_data[date_field] = None
+        for time_field in ['check_in', 'check_out']:
+            if emp_data[time_field] and emp_data[time_field].strip():
+                try:
+                    emp_data[time_field] = datetime.strptime(emp_data[time_field], '%H:%M').time()
+                except Exception:
+                    emp_data[time_field] = None
+            else:
+                emp_data[time_field] = None
+        for float_field in ['longitude', 'latitude', 'full_abs_fine', 'half_abd_fine']:
+            if emp_data[float_field] and emp_data[float_field].strip():
+                try:
+                    emp_data[float_field] = float(emp_data[float_field])
+                except Exception:
+                    emp_data[float_field] = None
+            else:
+                emp_data[float_field] = None
+        for int_field in ['yearly_leaves']:
+            if emp_data[int_field] and emp_data[int_field].strip():
+                try:
+                    emp_data[int_field] = int(emp_data[int_field])
+                except Exception:
+                    emp_data[int_field] = None
+            else:
+                emp_data[int_field] = None
+        # Check if employee exists (upsert logic)
+        existing_emp = EmpMaster.query.filter_by(emp_id=emp_data['emp_id']).first()
+        if existing_emp:
+            # Update existing employee
+            for key, value in emp_data.items():
+                if value:  # Only update non-empty values
+                    setattr(existing_emp, key, value)
             db.session.commit()
+            emp = existing_emp
         else:
-            # Update optional fields
-            person.email = email
-            person.phone = phone
-            try:
-                person.dob = datetime.strptime(dob, '%Y-%m-%d').date() if dob else person.dob
-            except ValueError:
-                flash(f'Invalid date format. Please use YYYY-MM-DD format.')
-                return redirect(url_for('add_person'))
+            # Insert new employee
+            emp = EmpMaster(**emp_data)
+            db.session.add(emp)
             db.session.commit()
-
+        
         # Save uploaded images into DB
         files = request.files.getlist('images')
         added = 0
@@ -231,15 +280,14 @@ def add_person():
                     data = file.read()
                     if not data:
                         continue
-                    db.session.add(PersonImage(person_id=person.id, filename=file.filename, image_data=data))
+                    db.session.add(EmployeeImage(emp_id=emp.emp_id, image_data=data, filename=file.filename))
                     added += 1
                 except Exception as e:
                     print(f'Error reading uploaded image: {e}')
         if added:
             db.session.commit()
-
         reload_faces()
-        flash('Person added successfully!')
+        flash('Employee added successfully!')
         return redirect(url_for('add_person'))
     return render_template('add_person.html')
 
@@ -255,127 +303,91 @@ def identify():
         if frame is None:
             return jsonify({'error': 'Invalid image', 'recognized': False}), 400
 
+        # Resize frame for faster processing
+        height, width = frame.shape[:2]
+        if height > 400:
+            scale = 400.0 / height
+            new_width = int(width * scale)
+            frame = cv2.resize(frame, (new_width, 400))
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=8, minSize=(50, 50))
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=3, minSize=(50, 50))
         if len(faces) == 0:
             return jsonify({'message': 'No face detected.', 'recognized': False})
 
-        if not label_to_name:
-            face_b64 = None
-            try:
-                x, y, w, h = faces[0]
-                frame_h, frame_w = frame.shape[:2]
-                expand_factor = 0.5
-                padding_x = int(w * expand_factor)
-                padding_y = int(h * expand_factor)
-                x1 = max(0, x - padding_x)
-                y1 = max(0, y - padding_y)
-                x2 = min(frame_w, x + w + padding_x)
-                y2 = min(frame_h, y + h + int(padding_y * 1.5))
-                color_crop = frame[y1:y2, x1:x2]
-                _, buf = cv2.imencode('.jpg', color_crop)
-                face_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-            except Exception as e:
-                print(f"Error preparing face image: {e}")
+        if not label_to_emp:
             return jsonify({
                 'recognized': False,
-                'message': 'No people trained yet. Add people first.',
-                'face_image': face_b64
+                'message': 'No employees registered yet.'
             })
 
-        STRICT_CONFIDENCE_THRESHOLD = 80
-        MODERATE_CONFIDENCE_THRESHOLD = 100  # not used; kept for backward compatibility
-        recognizers = [face_recognizer]
-        best_match = None
-        best_confidence = float('inf')
+        # Use only the largest face for maximum speed
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        
+        face_img = gray[y:y+h, x:x+w]
+        face_img = cv2.resize(face_img, (80, 80))  # Very small for speed
+        
+        # Single prediction only - no validation needed
+        label, confidence = face_recognizer.predict(face_img)
+        
         best_face_crop = None
-        all_predictions = []
-
-        # Optimized face processing
-        for (x, y, w, h) in faces:
-            face_img = gray[y:y+h, x:x+w]
+        if confidence < 35:  # Strict threshold
+            # Quick face crop
             try:
-                # Streamlined preprocessing
-                face_img = cv2.equalizeHist(face_img)
-                face_img = cv2.resize(face_img, (200, 200))
-                face_img_normalized = cv2.normalize(face_img, None, 0, 255, cv2.NORM_MINMAX)
-                
-                # Multiple predictions for accuracy
-                predictions = []
-                label1, conf1 = face_recognizer.predict(face_img_normalized)
-                predictions.append((label1, conf1))
-                
-                face_img_contrast = cv2.convertScaleAbs(face_img_normalized, alpha=1.2, beta=10)
-                label2, conf2 = face_recognizer.predict(face_img_contrast)
-                predictions.append((label2, conf2))
-                
-                # Find best prediction
-                best_prediction = min(predictions, key=lambda x: x[1])
-                label, confidence = best_prediction
-                
-                if confidence < best_confidence:
-                    best_confidence = confidence
-                    if confidence < STRICT_CONFIDENCE_THRESHOLD:
-                        best_match = label
-                        # Save face crop
-                        try:
-                            frame_h, frame_w = frame.shape[:2]
-                            expand_factor = 0.5
-                            padding_x = int(w * expand_factor)
-                            padding_y = int(h * expand_factor)
-                            x1 = max(0, x - padding_x)
-                            y1 = max(0, y - padding_y)
-                            x2 = min(frame_w, x + w + padding_x)
-                            y2 = min(frame_h, y + h + int(padding_y * 1.5))
-                            best_face_crop = frame[y1:y2, x1:x2]
-                        except Exception:
-                            best_face_crop = None
+                padding = 20
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(frame.shape[1], x + w + padding)
+                y2 = min(frame.shape[0], y + h + padding)
+                best_face_crop = frame[y1:y2, x1:x2]
             except Exception:
-                continue
+                pass
 
-        if best_match is not None and best_confidence < STRICT_CONFIDENCE_THRESHOLD:
-            name = label_to_name.get(best_match, 'Unknown')
-            validation_passed = validate_against_stored_images(face_img, name, best_confidence)
-            if validation_passed:
-                person_info = get_person_info(name)
+        if confidence < 35:  # Very strict
+            emp_id = label_to_emp.get(label, None)
+            if emp_id:
+                emp_info = get_employee_info(emp_id)
+                
+                # Quick attendance marking
+                today = datetime.utcnow().date()
+                current_time = datetime.utcnow().time()
+                
+                if emp_info['id']:
+                    # Ultra-fast attendance check with exists()
+                    existing = db.session.query(AttendanceMaster.id).filter_by(emp_id=emp_info['id'], att_date=today).first()
+                    if not existing:
+                        attendance = AttendanceMaster(
+                            emp_id=emp_info['id'],
+                            full_name=emp_info['name'],
+                            check_in=current_time,
+                            att_date=today,
+                            longitude='0.0',
+                            latitude='0.0',
+                            attendance_status='Present'
+                        )
+                        db.session.add(attendance)
+                        db.session.commit()
+                
                 face_b64 = None
                 if best_face_crop is not None:
                     try:
-                        _, buf = cv2.imencode('.jpg', best_face_crop)
+                        _, buf = cv2.imencode('.jpg', best_face_crop, [cv2.IMWRITE_JPEG_QUALITY, 70])
                         face_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-                    except Exception as e:
-                        print(f"Error encoding face crop: {e}")
+                    except Exception:
+                        pass
+                
                 return jsonify({
                     'recognized': True,
-                    'name': person_info.get('name'),
-                    'email': person_info.get('email', 'No email'),
-                    'phone': person_info.get('phone', 'No phone'),
-                    'dob': person_info.get('dob', 'No DOB'),
-                    'confidence': float(best_confidence),
+                    'emp_id': emp_info.get('emp_id'),
+                    'name': emp_info.get('name'),
+                    'email': emp_info.get('email', 'No email'),
+                    'phone': emp_info.get('phone', 'No phone'),
+                    'dob': emp_info.get('dob', 'No DOB'),
+                    'confidence': float(confidence),
                     'face_image': face_b64,
-                    'message': f"Identified: {person_info['name']} [Confidence: {best_confidence:.2f}]"
+                    'message': f"Welcome {emp_info['name']}! Attendance marked."
                 })
-        elif best_match is not None and best_confidence < MODERATE_CONFIDENCE_THRESHOLD:
-            name = label_to_name.get(best_match, 'Unknown')
-            person_info = get_person_info(name)
-            face_b64 = None
-            if best_face_crop is not None:
-                try:
-                    _, buf = cv2.imencode('.jpg', best_face_crop)
-                    face_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-                except Exception as e:
-                    print(f"Error encoding face crop: {e}")
-            return jsonify({
-                'recognized': True,
-                'name': person_info.get('name'),
-                'email': person_info.get('email', 'No email'),
-                'phone': person_info.get('phone', 'No phone'),
-                'dob': person_info.get('dob', 'No DOB'),
-                'confidence': float(best_confidence),
-                'face_image': face_b64,
-                'message': f"Identified: {person_info['name']} [Confidence: {best_confidence:.2f}] (Moderate match)"
-            })
+        # No valid match found
         return jsonify({
             'recognized': False,
             'message': 'Detection unsuccessful.'
@@ -391,11 +403,6 @@ def identify():
             'face_image': None
         }), 500
 
-@app.route('/register_unknown', methods=['POST'])
-def register_unknown():
-    return jsonify({'message': 'Unknown person registration is disabled.'}), 403
-
-    
 
 # Production configuration
 if __name__ == '__main__':
