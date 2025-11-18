@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from flask_cors import CORS
 import cv2
 import numpy as np
@@ -34,6 +35,20 @@ class Person(db.Model):
     phone = db.Column(db.String(20), nullable=True)
     dob = db.Column(db.Date, nullable=True)
     folder = db.Column(db.String(120), nullable=False)
+    # Images are stored in the database; folder kept for backward-compatibility
+    images = db.relationship('PersonImage', backref='person', lazy=True, cascade='all, delete-orphan')
+
+
+class PersonImage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    person_id = db.Column(db.Integer, db.ForeignKey('person.id'), nullable=False)
+    filename = db.Column(db.String(255), nullable=True)
+    image_data = db.Column(db.LargeBinary(length=16777216), nullable=False)  # up to 16MB
+    created_at = db.Column(db.DateTime, nullable=False, server_default=db.func.now())
+
+# Note: We no longer persist captured images. Images for training
+# must be added manually under 'known_person/<PersonName>/' and
+# metadata in the database via the Add Person form.
 
 # Optimized face recognizer training
 def train_face_recognizer():
@@ -50,45 +65,32 @@ def train_face_recognizer():
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     
     for person in people:
-        person_dir = os.path.join('known_person', person.folder)
-        if not os.path.isdir(person_dir):
-            continue
-            
         person_faces_count = 0
-        for img_name in os.listdir(person_dir):
-            if not img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                continue
-                
-            img_path = os.path.join(person_dir, img_name)
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            
-            detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
-            
-            for (x, y, w, h) in detected_faces:
-                face_roi = img[y:y+h, x:x+w]
-                face_roi = cv2.equalizeHist(face_roi)
-                face_roi = cv2.resize(face_roi, (200, 200))
-                face_roi = cv2.normalize(face_roi, None, 0, 255, cv2.NORM_MINMAX)
-                
-                sharpness = cv2.Laplacian(face_roi, cv2.CV_64F).var()
-                if sharpness > 10:
-                    faces.append(face_roi)
-                    labels.append(label)
-                    person_faces_count += 1
-            
-            # Fallback detection
-            if len(detected_faces) == 0:
-                detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.2, minNeighbors=2, minSize=(20, 20))
+        imgs = PersonImage.query.filter_by(person_id=person.id).all()
+        if not imgs:
+            continue
+        for img_row in imgs:
+            try:
+                npbuf = np.frombuffer(img_row.image_data, dtype=np.uint8)
+                img = cv2.imdecode(npbuf, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
+                if len(detected_faces) == 0:
+                    # Fallback detection
+                    detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.2, minNeighbors=2, minSize=(20, 20))
                 for (x, y, w, h) in detected_faces:
                     face_roi = img[y:y+h, x:x+w]
                     face_roi = cv2.equalizeHist(face_roi)
                     face_roi = cv2.resize(face_roi, (200, 200))
                     face_roi = cv2.normalize(face_roi, None, 0, 255, cv2.NORM_MINMAX)
-                    faces.append(face_roi)
-                    labels.append(label)
-                    person_faces_count += 1
+                    sharpness = cv2.Laplacian(face_roi, cv2.CV_64F).var()
+                    if sharpness > 10:
+                        faces.append(face_roi)
+                        labels.append(label)
+                        person_faces_count += 1
+            except Exception:
+                continue
         if person_faces_count > 0:
             label_to_name[label] = person.name
             label += 1
@@ -115,23 +117,22 @@ def reload_faces():
 
 def validate_against_stored_images(captured_face, person_name, confidence):
     try:
-        person_dir = os.path.join('known_person', person_name)
-        if not os.path.isdir(person_dir):
+        person = Person.query.filter_by(name=person_name).first()
+        if not person:
+            return False
+        imgs = PersonImage.query.filter_by(person_id=person.id).all()
+        if not imgs:
             return False
         
         face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         similar_matches = 0
         total_comparisons = 0
         
-        for img_name in os.listdir(person_dir):
-            if not img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
-                continue
-            img_path = os.path.join(person_dir, img_name)
-            stored_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            
+        for img_row in imgs:
+            npbuf = np.frombuffer(img_row.image_data, dtype=np.uint8)
+            stored_img = cv2.imdecode(npbuf, cv2.IMREAD_GRAYSCALE)
             if stored_img is None:
                 continue
-                
             stored_faces = face_cascade.detectMultiScale(stored_img, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
             
             for (x, y, w, h) in stored_faces:
@@ -195,17 +196,11 @@ def add_person():
         email = request.form['email']
         phone = request.form['phone']
         dob = request.form['dob']
-        folder = name
-        folder_path = os.path.join('known_person', folder)
-        os.makedirs(folder_path, exist_ok=True)
-        
-        files = request.files.getlist('images')
-        for idx, file in enumerate(files):
-            if file and file.filename:
-                file.save(os.path.join(folder_path, f'{idx+1}_{file.filename}'))
-        
-        if not Person.query.filter_by(name=name).first():
-            from datetime import datetime
+        folder = name  # keep for compatibility
+
+        # Upsert person record
+        person = Person.query.filter_by(name=name).first()
+        if not person:
             dob_date = None
             if dob:
                 try:
@@ -213,11 +208,36 @@ def add_person():
                 except ValueError:
                     flash(f'Invalid date format. Please use YYYY-MM-DD format.')
                     return redirect(url_for('add_person'))
-            
             person = Person(name=name, email=email, phone=phone, dob=dob_date, folder=folder)
             db.session.add(person)
             db.session.commit()
-        
+        else:
+            # Update optional fields
+            person.email = email
+            person.phone = phone
+            try:
+                person.dob = datetime.strptime(dob, '%Y-%m-%d').date() if dob else person.dob
+            except ValueError:
+                flash(f'Invalid date format. Please use YYYY-MM-DD format.')
+                return redirect(url_for('add_person'))
+            db.session.commit()
+
+        # Save uploaded images into DB
+        files = request.files.getlist('images')
+        added = 0
+        for idx, file in enumerate(files):
+            if file and file.filename:
+                try:
+                    data = file.read()
+                    if not data:
+                        continue
+                    db.session.add(PersonImage(person_id=person.id, filename=file.filename, image_data=data))
+                    added += 1
+                except Exception as e:
+                    print(f'Error reading uploaded image: {e}')
+        if added:
+            db.session.commit()
+
         reload_faces()
         flash('Person added successfully!')
         return redirect(url_for('add_person'))
@@ -265,7 +285,7 @@ def identify():
             })
 
         STRICT_CONFIDENCE_THRESHOLD = 80
-        MODERATE_CONFIDENCE_THRESHOLD = 100
+        MODERATE_CONFIDENCE_THRESHOLD = 100  # not used; kept for backward compatibility
         recognizers = [face_recognizer]
         best_match = None
         best_confidence = float('inf')
@@ -356,26 +376,9 @@ def identify():
                 'face_image': face_b64,
                 'message': f"Identified: {person_info['name']} [Confidence: {best_confidence:.2f}] (Moderate match)"
             })
-        face_b64 = None
-        try:
-            x, y, w, h = faces[0]
-            frame_h, frame_w = frame.shape[:2]
-            expand_factor = 0.5
-            padding_x = int(w * expand_factor)
-            padding_y = int(h * expand_factor)
-            x1 = max(0, x - padding_x)
-            y1 = max(0, y - padding_y)
-            x2 = min(frame_w, x + w + padding_x)
-            y2 = min(frame_h, y + h + int(padding_y * 1.5))
-            color_crop = frame[y1:y2, x1:x2]
-            _, buf = cv2.imencode('.jpg', color_crop)
-            face_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-        except Exception as e:
-            print(f"Error preparing unknown face image: {e}")
         return jsonify({
             'recognized': False,
-            'message': 'Face not recognized. (Try adding more images or check lighting)',
-            'face_image': face_b64
+            'message': 'Detection unsuccessful.'
         })
     except Exception as e:
         import traceback
@@ -391,6 +394,8 @@ def identify():
 @app.route('/register_unknown', methods=['POST'])
 def register_unknown():
     return jsonify({'message': 'Unknown person registration is disabled.'}), 403
+
+    
 
 # Production configuration
 if __name__ == '__main__':

@@ -96,7 +96,6 @@
                     regions.forEach(region => {
                         let skinPixels = 0;
                         let regionPixels = 0;
-                        
                         for (let y = region.y; y < region.y + region.h; y++) {
                             for (let x = region.x; x < region.x + region.w; x++) {
                                 if (x >= 0 && x < canvas.width && y >= 0 && y < canvas.height) {
@@ -104,19 +103,18 @@
                                     const r = imageData.data[idx];
                                     const g = imageData.data[idx + 1];
                                     const b = imageData.data[idx + 2];
-                                    
                                     if (detectSkinColor(r, g, b)) skinPixels++;
                                     regionPixels++;
                                 }
                             }
                         }
-                        
-                        if (regionPixels > 0 && skinPixels / regionPixels > 0.25) {
+                        // Lowered threshold: only 15% skin pixels needed
+                        if (regionPixels > 0 && skinPixels / regionPixels > 0.15) {
                             validRegions++;
                         }
                     });
-
-                    goodPositioning = validRegions >= 3;
+                    // Lowered region requirement: only 2 regions need to be valid
+                    goodPositioning = validRegions >= 2;
                     overlayCtx.strokeStyle = goodPositioning ? '#00ff00' : '#ff0000';
                     overlayCtx.lineWidth = 3;
                     overlayCtx.strokeRect(boxX, boxY, boxWidth, boxHeight);
@@ -205,22 +203,13 @@
                                       '<strong>DOB:</strong> ' + (data.dob || 'No DOB') + '<br>' +
                                       '<strong>Confidence:</strong> ' + (data.confidence ? data.confidence.toFixed(2) : 'N/A') + '<br><br>' +
                                       '<span style="color: #00aa00; font-weight: bold;">Detection successful.</span>';
-                cooldownUntil = Date.now() + 10000;
-            } else if (data.face_image) {
-                statusEl.innerHTML = '<span class="unknown">Unknown person</span>';
-                detailsEl.innerHTML = '<span style="color: #cc0000; font-weight: bold;">Detection unsuccessful.</span>';
-                cooldownUntil = Date.now() + 8000;
-                // No longer show registration modal for unknown persons
+                cooldownUntil = Date.now() + 4000;
             } else {
                 statusEl.innerText = data.message || 'No face';
                 detailsEl.innerText = '';
             }
-            if (data.face_image) {
-                faceImgEl.innerHTML = '';
-                faceImgEl.innerHTML = '<img src="data:image/jpeg;base64,' + data.face_image + '" alt="face">';
-            } else {
-                faceImgEl.innerHTML = '';
-            }
+            // We don't display images for unsuccessful detections
+            faceImgEl.innerHTML = '';
         }
 
         // --- Manual Capture Button ---
@@ -266,7 +255,7 @@
                             captureBtnMain.disabled = false;
                             captureBtnMain.textContent = 'Capture';
                             captureBtnMain.style.background = '#007bff';
-                        }, 10000); // 10 seconds cooldown
+                        }, 4000); // 4 seconds cooldown
                     })
                     .catch(err => {
                         statusEl.innerText = 'Error: ' + err.message;
