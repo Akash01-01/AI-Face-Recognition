@@ -377,6 +377,7 @@ def add_person():
         reload_faces()
         flash('Employee added successfully!')
         return redirect(url_for('add_person'))
+    return render_template('add_person.html')
 
 @app.route('/retrain')
 def force_retrain():
@@ -396,7 +397,6 @@ def force_retrain():
             'success': False,
             'error': str(e)
         })
-    return render_template('add_person.html')
 
 @app.route('/identify', methods=['POST'])
 def identify():
@@ -460,7 +460,7 @@ def identify():
         print(f'DEBUG: Available employees in label_to_emp: {list(label_to_emp.keys())}')
         
         best_face_crop = None
-        if confidence < 50:  # More lenient threshold for production
+        if confidence < 130:  # LBPH: lower is better, 30-80 excellent, <130 acceptable
             # Quick face crop
             try:
                 padding = 20
@@ -472,7 +472,7 @@ def identify():
             except Exception:
                 pass
 
-        if confidence < 50:  # More lenient for production
+        if confidence < 130:  # LBPH: accept typical match range
             emp_id = label_to_emp.get(label, None)
             print(f'DEBUG: Found emp_id: {emp_id} for label: {label}')
             if emp_id:
