@@ -3,34 +3,26 @@ from datetime import datetime
 from flask_cors import CORS
 try:
     import cv2
-    import numpy as np
     OPENCV_AVAILABLE = True
     print("✓ OpenCV imported successfully")
 except ImportError as e:
     print(f"✗ OpenCV import failed: {e}")
     OPENCV_AVAILABLE = False
-    # Create mock objects to prevent import errors
-    class MockCV2:
-        @staticmethod
-        def CascadeClassifier(*args): return None
-        @staticmethod
-        def cvtColor(*args): return None
-        @staticmethod
-        def detectMultiScale(*args): return []
-        @staticmethod
-        def resize(*args): return None
-        @staticmethod
-        def imdecode(*args): return None
-        @staticmethod
-        def imencode(*args): return (True, b'')
-        face = type('face', (), {'LBPHFaceRecognizer_create': lambda: None})()
-        data = type('data', (), {'haarcascades': ''})()
-        IMREAD_COLOR = 1
-        IMREAD_GRAYSCALE = 0
-        COLOR_BGR2GRAY = 7
-        IMWRITE_JPEG_QUALITY = 1
-    cv2 = MockCV2()
+    # Create simple mock for cv2
+    cv2 = None
+
+try:
     import numpy as np
+    print("✓ NumPy imported successfully")
+except ImportError as e:
+    print(f"✗ NumPy import failed: {e}")
+    # Simple numpy mock
+    class MockNumpy:
+        @staticmethod
+        def frombuffer(*args, **kwargs): return []
+        @staticmethod
+        def array(*args, **kwargs): return []
+    np = MockNumpy()
 import base64
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
@@ -55,10 +47,10 @@ face_recognizer = None
 label_to_emp = {}
 
 # Initialize face cascade with production error handling
-if OPENCV_AVAILABLE:
+if OPENCV_AVAILABLE and cv2:
     try:
         face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        if face_cascade.empty():
+        if hasattr(face_cascade, 'empty') and face_cascade.empty():
             print("ERROR: Face cascade failed to load!")
             face_cascade = None
         else:
@@ -252,15 +244,27 @@ def debug_info():
         emp_count = EmpMaster.query.count()
         img_count = EmployeeImage.query.count()
         return jsonify({
+            'status': 'App running successfully',
+            'opencv_available': OPENCV_AVAILABLE,
             'employees_in_db': emp_count,
             'images_in_db': img_count,
             'face_recognizer_loaded': face_recognizer is not None,
             'trained_labels': len(label_to_emp),
             'label_mapping': label_to_emp,
-            'face_cascade_loaded': not face_cascade.empty() if face_cascade else False
+            'face_cascade_loaded': face_cascade is not None and (not hasattr(face_cascade, 'empty') or not face_cascade.empty()),
+            'python_version': f"{__import__('sys').version_info.major}.{__import__('sys').version_info.minor}.{__import__('sys').version_info.micro}"
         })
     except Exception as e:
-        return jsonify({'error': str(e)})
+        return jsonify({'error': str(e), 'status': 'Error in debug endpoint'})
+
+@app.route('/test')
+def test_basic():
+    """Basic test endpoint to verify app is running"""
+    return jsonify({
+        'message': 'App is running successfully!',
+        'opencv_status': 'Available' if OPENCV_AVAILABLE else 'Not Available',
+        'timestamp': str(__import__('datetime').datetime.now())
+    })
 
 
 # Add new employee and images
