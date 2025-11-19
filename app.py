@@ -46,6 +46,9 @@ db = SQLAlchemy(app)
 face_recognizer = None
 label_to_emp = {}
 
+# Detect availability of OpenCV's face module (LBPH)
+FACE_MODULE_AVAILABLE = bool(OPENCV_AVAILABLE and cv2 and hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create'))
+
 # Initialize face cascade with production error handling
 if OPENCV_AVAILABLE and cv2:
     try:
@@ -131,6 +134,9 @@ class AttendanceMaster(db.Model):
 
 # Train recognizer using new employee tables
 def train_face_recognizer():
+    if not FACE_MODULE_AVAILABLE:
+        print("LBPH module not available - skipping training")
+        return None, {}
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     faces = []
     labels = []
@@ -168,7 +174,7 @@ def train_face_recognizer():
         if emp_faces_count > 0:
             label_to_emp[label] = emp.emp_id  # Store string emp_id
             label += 1
-    if faces and labels:
+    if faces and labels and recognizer is not None:
         recognizer.train(faces, np.array(labels))
     return recognizer, label_to_emp
 
@@ -208,27 +214,28 @@ def validate_confidence(confidence):
 with app.app_context():
     db.create_all()
     try:
-        # Check OpenCV availability first
         print("Checking OpenCV face recognition...")
-        test_recognizer = cv2.face.LBPHFaceRecognizer_create()
-        print("✓ OpenCV face recognition available")
-        
+        if FACE_MODULE_AVAILABLE:
+            print("✓ OpenCV LBPH (cv2.face) available")
+        else:
+            print("✗ OpenCV LBPH (cv2.face) NOT available - running in detection-only mode")
+
         emp_count = EmpMaster.query.count()
         img_count = EmployeeImage.query.count()
         print(f"Found {emp_count} employees and {img_count} images in database")
-        
-        if emp_count > 0 and face_cascade is not None:
+
+        if emp_count > 0 and face_cascade is not None and FACE_MODULE_AVAILABLE:
             print("Training face recognizer...")
             face_recognizer, label_to_emp = train_face_recognizer()
             print(f"✓ Trained with {len(label_to_emp)} employees")
         else:
-            face_recognizer = cv2.face.LBPHFaceRecognizer_create()
+            face_recognizer = None
             label_to_emp = {}
             if face_cascade is None:
                 print("⚠ Face cascade not available - face detection disabled")
     except Exception as e:
         print(f"Initialization error: {e}")
-        face_recognizer = cv2.face.LBPHFaceRecognizer_create()
+        face_recognizer = None
         label_to_emp = {}
 
 
@@ -436,7 +443,15 @@ def identify():
         
         face_img = gray[y:y+h, x:x+w]
         face_img = cv2.resize(face_img, (80, 80))  # Very small for speed
-        
+
+        # Ensure recognizer is available
+        if face_recognizer is None:
+            return jsonify({
+                'recognized': False,
+                'message': 'Face recognition temporarily unavailable on server.',
+                'debug': 'cv2.face module not available; install opencv-contrib-python-headless'
+            }), 503
+
         # Single prediction only - no validation needed
         label, confidence = face_recognizer.predict(face_img)
         
