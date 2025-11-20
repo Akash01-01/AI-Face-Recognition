@@ -209,8 +209,12 @@ def get_employee_info(emp_id):
 
 
 def reload_faces():
-    global face_recognizer, label_to_emp
+    global face_recognizer, label_to_emp, face_recognizer_loaded
+    print("Retraining face recognizer with updated data...")
+    face_recognizer_loaded = False  # Reset flag to allow reload
     face_recognizer, label_to_emp = train_face_recognizer()
+    face_recognizer_loaded = True  # Mark as loaded after successful training
+    print(f"✓ Retrained with {len(label_to_emp)} employees")
 
 
 def validate_face_quality(face_img, width, height):
@@ -294,34 +298,24 @@ def load_face_recognizer():
         # Don't set loaded=True on error, allow retry on next request
         return False
 
-# Initialize database tables (safe during startup)
+# Initialize database tables and train recognizer at startup for BOTH local and production
 with app.app_context():
     try:
         db.create_all()
         print("✓ Database tables ready")
         
-        # Detect environment: Render uses PORT env var
-        is_production = os.environ.get('PORT') is not None or os.environ.get('RENDER') is not None
-        
-        if not is_production:
-            # LOCAL: Train at startup for immediate use
-            print("Local mode: Training at startup...")
-            if FACE_MODULE_AVAILABLE:
-                print("✓ OpenCV LBPH (cv2.face) available")
-                load_face_recognizer()
-            else:
-                print("✗ OpenCV LBPH not available")
+        # ALWAYS train at startup for immediate recognition (both local and production)
+        if FACE_MODULE_AVAILABLE:
+            print("✓ OpenCV LBPH (cv2.face) available")
+            print("Training face recognizer at startup for immediate recognition...")
+            load_face_recognizer()
         else:
-            # PRODUCTION (Render): Skip training at startup to avoid MySQL timeout
-            print("Production mode: Will train on first recognition request")
-            if FACE_MODULE_AVAILABLE:
-                print("✓ OpenCV LBPH (cv2.face) available")
-            else:
-                print("✗ OpenCV LBPH not available")
+            print("✗ OpenCV LBPH not available")
     except Exception as e:
-        print(f"Startup warning: {e}")
+        print(f"Startup error: {e}")
         import traceback
         traceback.print_exc()
+        print("⚠ Will attempt to load recognizer on first recognition request")
 
 
 # Routes
@@ -498,14 +492,14 @@ def force_retrain():
 @app.route('/identify', methods=['POST'])
 def identify():
     try:
-        # Lazy load recognizer on first request (for production deployment)
-        if not face_recognizer_loaded:
-            print("First recognition request - loading face recognizer...")
+        # Safety check: If recognizer failed at startup, try loading now
+        if not face_recognizer_loaded or face_recognizer is None:
+            print("Recognizer not loaded at startup - attempting to load now...")
             success = load_face_recognizer()
-            if not success:
+            if not success or face_recognizer is None:
                 return jsonify({
                     'recognized': False,
-                    'message': 'Face recognition system is initializing. Please try again in a moment.',
+                    'message': 'Face recognition system is unavailable. Please ensure employees are registered.',
                     'error': 'Recognizer not loaded'
                 }), 503
         
