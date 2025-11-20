@@ -31,13 +31,19 @@ from flask_sqlalchemy import SQLAlchemy
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your_super_secret_key_here_change_in_production')
 # Database configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://u673831287_qa_attdb:p*NsybHiq0V@92.113.22.3/u673831287_qa_attdb'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://u673831287_qa_attdb:p*NsybHiq0V@92.113.22.3/u673831287_qa_attdb?connect_timeout=10'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # Disable to save memory
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'pool_pre_ping': True,
-    'pool_recycle': 280,
-    'pool_timeout': 20,
-    'max_overflow': 0
+    'pool_pre_ping': True,        # Test connections before using
+    'pool_recycle': 280,          # Recycle connections after 280 seconds
+    'pool_timeout': 20,           # Wait up to 20 seconds for connection
+    'max_overflow': 0,            # No overflow connections
+    'pool_size': 5,               # Maintain 5 connections in pool
+    'connect_args': {
+        'connect_timeout': 10,    # MySQL connection timeout
+        'read_timeout': 30,       # Read timeout
+        'write_timeout': 30       # Write timeout
+    }
 }
 CORS(app)
 db = SQLAlchemy(app)
@@ -242,21 +248,30 @@ def validate_face_quality(face_img, width, height):
     
     return True, "Quality OK"
 
-# Initialize application
-with app.app_context():
-    db.create_all()
+# Lazy loading flag - train on first request to avoid startup connection issues
+face_recognizer_initialized = False
+
+def ensure_face_recognizer_loaded():
+    """Lazy load face recognizer on first request to avoid deployment connection issues"""
+    global face_recognizer, label_to_emp, face_recognizer_initialized
+    
+    if face_recognizer_initialized:
+        return
+    
     try:
-        print("Checking OpenCV face recognition...")
+        print("Lazy loading face recognizer...")
         if FACE_MODULE_AVAILABLE:
             print("✓ OpenCV LBPH (cv2.face) available")
         else:
             print("✗ OpenCV LBPH (cv2.face) NOT available - running in detection-only mode")
+            face_recognizer_initialized = True
+            return
 
         emp_count = EmpMaster.query.count()
         img_count = EmployeeImage.query.count()
         print(f"Found {emp_count} employees and {img_count} images in database")
 
-        if emp_count > 0 and face_cascade is not None and FACE_MODULE_AVAILABLE:
+        if emp_count > 0 and face_cascade is not None:
             print("Training face recognizer...")
             face_recognizer, label_to_emp = train_face_recognizer()
             print(f"✓ Trained with {len(label_to_emp)} employees")
@@ -265,10 +280,21 @@ with app.app_context():
             label_to_emp = {}
             if face_cascade is None:
                 print("⚠ Face cascade not available - face detection disabled")
+        
+        face_recognizer_initialized = True
     except Exception as e:
-        print(f"Initialization error: {e}")
+        print(f"Face recognizer initialization error: {e}")
         face_recognizer = None
         label_to_emp = {}
+        face_recognizer_initialized = True
+
+# Initialize database tables only (no queries during startup)
+with app.app_context():
+    try:
+        db.create_all()
+        print("✓ Database tables initialized")
+    except Exception as e:
+        print(f"Database initialization warning: {e}")
 
 
 # Routes
@@ -280,6 +306,7 @@ def index():
 def debug_info():
     """Debug endpoint to check production status"""
     try:
+        ensure_face_recognizer_loaded()  # Lazy load
         emp_count = EmpMaster.query.count()
         img_count = EmployeeImage.query.count()
         return jsonify({
@@ -414,10 +441,11 @@ def add_person():
 @app.route('/retrain')
 def force_retrain():
     """Force retrain face recognizer for production"""
-    global face_recognizer, label_to_emp
+    global face_recognizer, label_to_emp, face_recognizer_initialized
     try:
         old_count = len(label_to_emp)
         face_recognizer, label_to_emp = train_face_recognizer()
+        face_recognizer_initialized = True  # Mark as initialized
         return jsonify({
             'success': True,
             'message': f'Retrained: {old_count} -> {len(label_to_emp)} employees',
@@ -433,6 +461,8 @@ def force_retrain():
 @app.route('/identify', methods=['POST'])
 def identify():
     try:
+        ensure_face_recognizer_loaded()  # Lazy load on first recognition request
+        
         file = request.files.get('image')
         if file is None:
             return jsonify({'error': 'No image provided', 'recognized': False}), 400
