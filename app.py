@@ -302,6 +302,15 @@ with app.app_context():
 def index():
     return render_template('index.html')
 
+@app.route('/health')
+def health_check():
+    """Simple health check for Render.com - no DB queries"""
+    return jsonify({
+        'status': 'healthy',
+        'opencv': OPENCV_AVAILABLE,
+        'lbph_available': FACE_MODULE_AVAILABLE
+    }), 200
+
 @app.route('/debug')
 def debug_info():
     """Debug endpoint to check production status"""
