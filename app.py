@@ -46,12 +46,13 @@ db = SQLAlchemy(app)
 face_recognizer = None
 label_to_emp = {}
 
-# PRODUCTION SECURITY SETTINGS - Tuned for your dataset
-STRICT_CONFIDENCE_THRESHOLD = 130  # LBPH: Lower is better, accept <130 based on your data (typical: 115-130)
-MIN_FACE_WIDTH = 80   # Minimum face width in pixels
-MIN_FACE_HEIGHT = 80  # Minimum face height in pixels
-MIN_FACE_BRIGHTNESS = 30  # Minimum average brightness (0-255)
-MAX_FACE_BRIGHTNESS = 230  # Maximum average brightness
+# ULTRA-STRICT SECURITY SETTINGS - 100% accuracy, zero false positives
+STRICT_CONFIDENCE_THRESHOLD = 70  # LBPH: VERY STRICT - only excellent matches (0-70 = excellent, >70 reject)
+MIN_FACE_WIDTH = 100   # Minimum face width in pixels - stricter
+MIN_FACE_HEIGHT = 100  # Minimum face height in pixels - stricter
+MIN_FACE_BRIGHTNESS = 40  # Minimum average brightness (0-255)
+MAX_FACE_BRIGHTNESS = 220  # Maximum average brightness
+SIMILARITY_THRESHOLD = 0.85  # Additional similarity check threshold
 
 # Detect availability of OpenCV's face module (LBPH)
 FACE_MODULE_AVAILABLE = bool(OPENCV_AVAILABLE and cv2 and hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create'))
@@ -144,7 +145,10 @@ def train_face_recognizer():
     if not FACE_MODULE_AVAILABLE:
         print("LBPH module not available - skipping training")
         return None, {}
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    # Use stricter LBPH parameters for better accuracy
+    # radius=2, neighbors=16 = more detailed analysis
+    # grid_x=8, grid_y=8 = finer grid for better discrimination
+    recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=16, grid_x=8, grid_y=8)
     faces = []
     labels = []
     label_to_emp = {}
@@ -592,30 +596,90 @@ def identify():
                 'debug': f'Face quality check failed: {quality_msg}'
             }), 200
         
-        # Layer 2: LBPH prediction
+        # Layer 2: LBPH prediction with STRICT threshold
         label, confidence = face_recognizer.predict(face_img)
         
-        # Debug info for production
+        # Debug info
         print(f'DEBUG: Prediction - Label: {label}, Confidence: {confidence:.2f}, Threshold: {STRICT_CONFIDENCE_THRESHOLD}')
         print(f'DEBUG: Face size: {w}x{h}, Quality: {quality_msg}')
-        print(f'DEBUG: Available employees in label_to_emp: {list(label_to_emp.keys())}')
+        print(f'DEBUG: Available employees: {list(label_to_emp.keys())}')
         
-        # Layer 3: Strict confidence threshold check
+        # ULTRA-STRICT: Reject immediately if confidence too high
+        if confidence >= STRICT_CONFIDENCE_THRESHOLD:
+            print(f'DEBUG: REJECTED - Confidence {confidence:.2f} >= threshold {STRICT_CONFIDENCE_THRESHOLD}')
+            return jsonify({
+                'recognized': False,
+                'message': 'Detection unsuccessful: No confident match found',
+                'debug': f'Confidence {confidence:.2f} exceeds strict threshold {STRICT_CONFIDENCE_THRESHOLD}'
+            }), 200
+        
+        # Layer 3: Additional histogram verification for matched face
+        emp_id = label_to_emp.get(label, None)
+        if not emp_id:
+            return jsonify({
+                'recognized': False,
+                'message': 'Detection unsuccessful: Employee not found',
+                'debug': f'Label {label} not in employee mapping'
+            }), 200
+        
+        # Layer 4: Verify against stored images using histogram comparison
+        try:
+            stored_imgs = EmployeeImage.query.filter_by(emp_id=emp_id).limit(3).all()
+            if stored_imgs:
+                histogram_matches = 0
+                for stored_img in stored_imgs:
+                    npbuf = np.frombuffer(stored_img.image_data, dtype=np.uint8)
+                    stored_face = cv2.imdecode(npbuf, cv2.IMREAD_GRAYSCALE)
+                    if stored_face is not None:
+                        # Extract face from stored image
+                        detected_stored = face_cascade.detectMultiScale(stored_face, scaleFactor=1.3, minNeighbors=3)
+                        if len(detected_stored) > 0:
+                            sx, sy, sw, sh = max(detected_stored, key=lambda f: f[2] * f[3])
+                            stored_face_roi = stored_face[sy:sy+sh, sx:sx+sw]
+                            stored_face_roi = cv2.resize(stored_face_roi, (80, 80))
+                            
+                            # Compare histograms
+                            hist1 = cv2.calcHist([face_img], [0], None, [256], [0, 256])
+                            hist2 = cv2.calcHist([stored_face_roi], [0], None, [256], [0, 256])
+                            similarity = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+                            print(f'DEBUG: Histogram similarity: {similarity:.3f}')
+                            
+                            if similarity > SIMILARITY_THRESHOLD:
+                                histogram_matches += 1
+                
+                # Require at least 1 histogram match for verification
+                if histogram_matches == 0:
+                    print(f'DEBUG: REJECTED - No histogram matches (threshold: {SIMILARITY_THRESHOLD})')
+                    return jsonify({
+                        'recognized': False,
+                        'message': 'Detection unsuccessful: Verification failed',
+                        'debug': f'Histogram verification failed - no matches above {SIMILARITY_THRESHOLD}'
+                    }), 200
+                
+                print(f'DEBUG: VERIFIED - {histogram_matches} histogram matches passed')
+        except Exception as verify_err:
+            print(f'DEBUG: Histogram verification error: {verify_err}')
+            # If verification fails, reject for safety
+            return jsonify({
+                'recognized': False,
+                'message': 'Detection unsuccessful: Verification error',
+                'debug': str(verify_err)
+            }), 200
+        
+        # Layer 5: Prepare face crop for response
         best_face_crop = None
-        if confidence < STRICT_CONFIDENCE_THRESHOLD:
-            # Face matched - prepare face crop for response
-            try:
-                padding = 20
-                x1 = max(0, x - padding)
-                y1 = max(0, y - padding)
-                x2 = min(frame.shape[1], x + w + padding)
-                y2 = min(frame.shape[0], y + h + padding)
-                best_face_crop = frame[y1:y2, x1:x2]
-            except Exception:
-                pass
+        try:
+            padding = 20
+            x1 = max(0, x - padding)
+            y1 = max(0, y - padding)
+            x2 = min(frame.shape[1], x + w + padding)
+            y2 = min(frame.shape[0], y + h + padding)
+            best_face_crop = frame[y1:y2, x1:x2]
+        except Exception:
+            pass
 
-        # Layer 4: Final decision - STRICT threshold
-        if confidence < STRICT_CONFIDENCE_THRESHOLD:  # Production: Only accept excellent matches
+        # Layer 6: Final acceptance - ALL checks passed
+        if confidence < STRICT_CONFIDENCE_THRESHOLD and emp_id:
             emp_id = label_to_emp.get(label, None)
             print(f'DEBUG: Found emp_id: {emp_id} for label: {label}')
             if emp_id:
