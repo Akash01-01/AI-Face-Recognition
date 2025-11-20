@@ -258,9 +258,21 @@ def load_face_recognizer():
             face_recognizer_loaded = True
             return False
 
-        emp_count = EmpMaster.query.count()
-        img_count = EmployeeImage.query.count()
-        print(f"Found {emp_count} employees and {img_count} images in database")
+        # Retry logic for database connection (especially for first request on Render)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                emp_count = EmpMaster.query.count()
+                img_count = EmployeeImage.query.count()
+                print(f"Found {emp_count} employees and {img_count} images in database")
+                break
+            except Exception as db_err:
+                if attempt < max_retries - 1:
+                    print(f"Database connection attempt {attempt + 1} failed, retrying...")
+                    import time
+                    time.sleep(1)
+                else:
+                    raise db_err
 
         if emp_count > 0 and face_cascade is not None:
             print("Training face recognizer...")
@@ -279,7 +291,7 @@ def load_face_recognizer():
         traceback.print_exc()
         face_recognizer = None
         label_to_emp = {}
-        face_recognizer_loaded = True
+        # Don't set loaded=True on error, allow retry on next request
         return False
 
 # Initialize database tables (safe during startup)
@@ -489,7 +501,13 @@ def identify():
         # Lazy load recognizer on first request (for production deployment)
         if not face_recognizer_loaded:
             print("First recognition request - loading face recognizer...")
-            load_face_recognizer()
+            success = load_face_recognizer()
+            if not success:
+                return jsonify({
+                    'recognized': False,
+                    'message': 'Face recognition system is initializing. Please try again in a moment.',
+                    'error': 'Recognizer not loaded'
+                }), 503
         
         file = request.files.get('image')
         if file is None:
@@ -576,51 +594,65 @@ def identify():
                 pass
 
         # Layer 4: Final decision - STRICT threshold
-        if confidence < STRICT_CONFIDENCE_THRESHOLD:  # Production: Only accept excellent matches (0-50)
+        if confidence < STRICT_CONFIDENCE_THRESHOLD:  # Production: Only accept excellent matches
             emp_id = label_to_emp.get(label, None)
             print(f'DEBUG: Found emp_id: {emp_id} for label: {label}')
             if emp_id:
-                emp_info = get_employee_info(emp_id)
-                
-                # Quick attendance marking
-                today = datetime.utcnow().date()
-                current_time = datetime.utcnow().time()
-                
-                if emp_info['id']:
-                    # Ultra-fast attendance check with exists()
-                    existing = db.session.query(AttendanceMaster.id).filter_by(emp_id=emp_info['id'], att_date=today).first()
-                    if not existing:
-                        attendance = AttendanceMaster(
-                            emp_id=emp_info['id'],
-                            full_name=emp_info['name'],
-                            check_in=current_time,
-                            att_date=today,
-                            longitude='0.0',
-                            latitude='0.0',
-                            attendance_status='Present'
-                        )
-                        db.session.add(attendance)
-                        db.session.commit()
-                
-                face_b64 = None
-                if best_face_crop is not None:
+                try:
+                    emp_info = get_employee_info(emp_id)
+                    
+                    # Quick attendance marking with error handling
                     try:
-                        _, buf = cv2.imencode('.jpg', best_face_crop, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                        face_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-                    except Exception:
-                        pass
-                
-                return jsonify({
-                    'recognized': True,
-                    'emp_id': emp_info.get('emp_id'),
-                    'name': emp_info.get('name'),
-                    'email': emp_info.get('email', 'No email'),
-                    'phone': emp_info.get('phone', 'No phone'),
-                    'dob': emp_info.get('dob', 'No DOB'),
-                    'confidence': float(confidence),
-                    'face_image': face_b64,
-                    'message': f"Welcome {emp_info['name']}! Attendance marked."
-                })
+                        from datetime import datetime as dt, timezone
+                        today = dt.now(timezone.utc).date()
+                        current_time = dt.now(timezone.utc).time()
+                        
+                        if emp_info and emp_info.get('id'):
+                            # Ultra-fast attendance check
+                            existing = db.session.query(AttendanceMaster.id).filter_by(
+                                emp_id=emp_info['id'], 
+                                att_date=today
+                            ).first()
+                            if not existing:
+                                attendance = AttendanceMaster(
+                                    emp_id=emp_info['id'],
+                                    full_name=emp_info.get('name', 'Unknown'),
+                                    check_in=current_time,
+                                    att_date=today,
+                                    longitude='0.0',
+                                    latitude='0.0',
+                                    attendance_status='Present'
+                                )
+                                db.session.add(attendance)
+                                db.session.commit()
+                    except Exception as att_err:
+                        print(f"Attendance marking error (non-critical): {att_err}")
+                        # Continue even if attendance fails
+                    
+                    # Prepare face image
+                    face_b64 = None
+                    if best_face_crop is not None:
+                        try:
+                            _, buf = cv2.imencode('.jpg', best_face_crop, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                            face_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+                        except Exception as img_err:
+                            print(f"Face image encoding error: {img_err}")
+                    
+                    return jsonify({
+                        'recognized': True,
+                        'emp_id': emp_info.get('emp_id', 'Unknown'),
+                        'name': emp_info.get('name', 'Unknown'),
+                        'email': emp_info.get('email', 'No email'),
+                        'phone': emp_info.get('phone', 'No phone'),
+                        'dob': emp_info.get('dob', 'No DOB'),
+                        'confidence': float(confidence),
+                        'face_image': face_b64,
+                        'message': f"Welcome {emp_info.get('name', 'User')}! Attendance marked."
+                    })
+                except Exception as emp_err:
+                    print(f"Employee info error: {emp_err}")
+                    import traceback
+                    traceback.print_exc()
         # No valid match found
         return jsonify({
             'recognized': False,
