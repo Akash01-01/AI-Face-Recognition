@@ -52,12 +52,12 @@ db = SQLAlchemy(app)
 face_recognizer = None
 label_to_emp = {}
 
-# PRODUCTION SECURITY SETTINGS - Strict validation to prevent false positives
-STRICT_CONFIDENCE_THRESHOLD = 50  # LBPH: 0-50 excellent, 50-80 good, >80 reject
-MIN_FACE_WIDTH = 100  # Minimum face width in pixels
-MIN_FACE_HEIGHT = 100  # Minimum face height in pixels
-MIN_FACE_BRIGHTNESS = 40  # Minimum average brightness (0-255)
-MAX_FACE_BRIGHTNESS = 220  # Maximum average brightness to avoid overexposure
+# PRODUCTION SECURITY SETTINGS - Balanced validation for security and usability
+STRICT_CONFIDENCE_THRESHOLD = 80  # LBPH: <50 excellent, <80 good/secure, >80 reject
+MIN_FACE_WIDTH = 80   # Minimum face width in pixels (relaxed from 100)
+MIN_FACE_HEIGHT = 80  # Minimum face height in pixels (relaxed from 100)
+MIN_FACE_BRIGHTNESS = 30  # Minimum average brightness (0-255, relaxed)
+MAX_FACE_BRIGHTNESS = 230  # Maximum average brightness (relaxed)
 
 # Detect availability of OpenCV's face module (LBPH)
 FACE_MODULE_AVAILABLE = bool(OPENCV_AVAILABLE and cv2 and hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create'))
@@ -241,7 +241,7 @@ def validate_face_quality(face_img, width, height):
     # Check 3: Face contrast (reject flat/washed out images)
     try:
         std_dev = np.std(face_img)
-        if std_dev < 15:  # Very low contrast
+        if std_dev < 10:  # Very low contrast (relaxed from 15)
             return False, "Poor image quality. Improve lighting contrast."
     except Exception:
         pass
@@ -293,6 +293,11 @@ with app.app_context():
     try:
         db.create_all()
         print("✓ Database tables initialized")
+        
+        # For local development: Train at startup if TRAIN_AT_STARTUP env var is set
+        if os.environ.get('TRAIN_AT_STARTUP', 'false').lower() == 'true':
+            print("Training at startup (local development mode)...")
+            ensure_face_recognizer_loaded()
     except Exception as e:
         print(f"Database initialization warning: {e}")
 
@@ -321,11 +326,14 @@ def debug_info():
         return jsonify({
             'status': 'App running successfully',
             'opencv_available': OPENCV_AVAILABLE,
+            'lbph_module_available': FACE_MODULE_AVAILABLE,
             'employees_in_db': emp_count,
             'images_in_db': img_count,
             'face_recognizer_loaded': face_recognizer is not None,
+            'face_recognizer_initialized': face_recognizer_initialized,
             'trained_labels': len(label_to_emp),
             'label_mapping': label_to_emp,
+            'confidence_threshold': STRICT_CONFIDENCE_THRESHOLD,
             'face_cascade_loaded': face_cascade is not None and (not hasattr(face_cascade, 'empty') or not face_cascade.empty()),
             'python_version': f"{__import__('sys').version_info.major}.{__import__('sys').version_info.minor}.{__import__('sys').version_info.micro}"
         })
