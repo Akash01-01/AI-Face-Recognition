@@ -31,19 +31,13 @@ from flask_sqlalchemy import SQLAlchemy
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your_super_secret_key_here_change_in_production')
 # Database configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://u673831287_qa_attdb:p*NsybHiq0V@92.113.22.3/u673831287_qa_attdb?connect_timeout=10'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # Disable to save memory
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://u673831287_qa_attdb:p*NsybHiq0V@92.113.22.3/u673831287_qa_attdb'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'pool_pre_ping': True,        # Test connections before using
-    'pool_recycle': 280,          # Recycle connections after 280 seconds
-    'pool_timeout': 20,           # Wait up to 20 seconds for connection
-    'max_overflow': 0,            # No overflow connections
-    'pool_size': 5,               # Maintain 5 connections in pool
-    'connect_args': {
-        'connect_timeout': 10,    # MySQL connection timeout
-        'read_timeout': 30,       # Read timeout
-        'write_timeout': 30       # Write timeout
-    }
+    'pool_pre_ping': True,
+    'pool_recycle': 280,
+    'pool_timeout': 20,
+    'max_overflow': 0
 }
 CORS(app)
 db = SQLAlchemy(app)
@@ -52,12 +46,12 @@ db = SQLAlchemy(app)
 face_recognizer = None
 label_to_emp = {}
 
-# PRODUCTION SECURITY SETTINGS - Balanced validation for security and usability
-STRICT_CONFIDENCE_THRESHOLD = 80  # LBPH: <50 excellent, <80 good/secure, >80 reject
-MIN_FACE_WIDTH = 80   # Minimum face width in pixels (relaxed from 100)
-MIN_FACE_HEIGHT = 80  # Minimum face height in pixels (relaxed from 100)
-MIN_FACE_BRIGHTNESS = 30  # Minimum average brightness (0-255, relaxed)
-MAX_FACE_BRIGHTNESS = 230  # Maximum average brightness (relaxed)
+# PRODUCTION SECURITY SETTINGS - Tuned for your dataset
+STRICT_CONFIDENCE_THRESHOLD = 130  # LBPH: Lower is better, accept <130 based on your data (typical: 115-130)
+MIN_FACE_WIDTH = 80   # Minimum face width in pixels
+MIN_FACE_HEIGHT = 80  # Minimum face height in pixels
+MIN_FACE_BRIGHTNESS = 30  # Minimum average brightness (0-255)
+MAX_FACE_BRIGHTNESS = 230  # Maximum average brightness
 
 # Detect availability of OpenCV's face module (LBPH)
 FACE_MODULE_AVAILABLE = bool(OPENCV_AVAILABLE and cv2 and hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create'))
@@ -248,30 +242,21 @@ def validate_face_quality(face_img, width, height):
     
     return True, "Quality OK"
 
-# Lazy loading flag - train on first request to avoid startup connection issues
-face_recognizer_initialized = False
-
-def ensure_face_recognizer_loaded():
-    """Lazy load face recognizer on first request to avoid deployment connection issues"""
-    global face_recognizer, label_to_emp, face_recognizer_initialized
-    
-    if face_recognizer_initialized:
-        return
-    
+# Initialize application with training at startup
+with app.app_context():
+    db.create_all()
     try:
-        print("Lazy loading face recognizer...")
+        print("Checking OpenCV face recognition...")
         if FACE_MODULE_AVAILABLE:
             print("✓ OpenCV LBPH (cv2.face) available")
         else:
             print("✗ OpenCV LBPH (cv2.face) NOT available - running in detection-only mode")
-            face_recognizer_initialized = True
-            return
 
         emp_count = EmpMaster.query.count()
         img_count = EmployeeImage.query.count()
         print(f"Found {emp_count} employees and {img_count} images in database")
 
-        if emp_count > 0 and face_cascade is not None:
+        if emp_count > 0 and face_cascade is not None and FACE_MODULE_AVAILABLE:
             print("Training face recognizer...")
             face_recognizer, label_to_emp = train_face_recognizer()
             print(f"✓ Trained with {len(label_to_emp)} employees")
@@ -280,26 +265,10 @@ def ensure_face_recognizer_loaded():
             label_to_emp = {}
             if face_cascade is None:
                 print("⚠ Face cascade not available - face detection disabled")
-        
-        face_recognizer_initialized = True
     except Exception as e:
-        print(f"Face recognizer initialization error: {e}")
+        print(f"Initialization error: {e}")
         face_recognizer = None
         label_to_emp = {}
-        face_recognizer_initialized = True
-
-# Initialize database tables only (no queries during startup)
-with app.app_context():
-    try:
-        db.create_all()
-        print("✓ Database tables initialized")
-        
-        # For local development: Train at startup if TRAIN_AT_STARTUP env var is set
-        if os.environ.get('TRAIN_AT_STARTUP', 'false').lower() == 'true':
-            print("Training at startup (local development mode)...")
-            ensure_face_recognizer_loaded()
-    except Exception as e:
-        print(f"Database initialization warning: {e}")
 
 
 # Routes
@@ -320,7 +289,6 @@ def health_check():
 def debug_info():
     """Debug endpoint to check production status"""
     try:
-        ensure_face_recognizer_loaded()  # Lazy load
         emp_count = EmpMaster.query.count()
         img_count = EmployeeImage.query.count()
         return jsonify({
@@ -330,7 +298,6 @@ def debug_info():
             'employees_in_db': emp_count,
             'images_in_db': img_count,
             'face_recognizer_loaded': face_recognizer is not None,
-            'face_recognizer_initialized': face_recognizer_initialized,
             'trained_labels': len(label_to_emp),
             'label_mapping': label_to_emp,
             'confidence_threshold': STRICT_CONFIDENCE_THRESHOLD,
@@ -458,11 +425,10 @@ def add_person():
 @app.route('/retrain')
 def force_retrain():
     """Force retrain face recognizer for production"""
-    global face_recognizer, label_to_emp, face_recognizer_initialized
+    global face_recognizer, label_to_emp
     try:
         old_count = len(label_to_emp)
         face_recognizer, label_to_emp = train_face_recognizer()
-        face_recognizer_initialized = True  # Mark as initialized
         return jsonify({
             'success': True,
             'message': f'Retrained: {old_count} -> {len(label_to_emp)} employees',
@@ -478,8 +444,6 @@ def force_retrain():
 @app.route('/identify', methods=['POST'])
 def identify():
     try:
-        ensure_face_recognizer_loaded()  # Lazy load on first recognition request
-        
         file = request.files.get('image')
         if file is None:
             return jsonify({'error': 'No image provided', 'recognized': False}), 400
