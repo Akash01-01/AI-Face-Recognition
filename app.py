@@ -298,24 +298,51 @@ def load_face_recognizer():
         # Don't set loaded=True on error, allow retry on next request
         return False
 
-# Initialize database tables and train recognizer at startup for BOTH local and production
+# Background training after app starts (avoids Gunicorn startup timeout)
+def train_in_background():
+    """Train recognizer in background thread after app is fully started"""
+    import time
+    time.sleep(2)  # Wait for app to fully start
+    with app.app_context():
+        try:
+            print("Background training started...")
+            if FACE_MODULE_AVAILABLE:
+                load_face_recognizer()
+                print("✓ Background training complete")
+            else:
+                print("✗ OpenCV LBPH not available for training")
+        except Exception as e:
+            print(f"Background training error: {e}")
+            import traceback
+            traceback.print_exc()
+
+# Initialize database tables ONLY (no DB queries to avoid Gunicorn timeout)
 with app.app_context():
     try:
         db.create_all()
         print("✓ Database tables ready")
         
-        # ALWAYS train at startup for immediate recognition (both local and production)
-        if FACE_MODULE_AVAILABLE:
-            print("✓ OpenCV LBPH (cv2.face) available")
-            print("Training face recognizer at startup for immediate recognition...")
-            load_face_recognizer()
+        # Detect if running under Gunicorn (production) or local dev server
+        import sys
+        is_gunicorn = "gunicorn" in sys.argv[0] if sys.argv else False
+        
+        if is_gunicorn:
+            # PRODUCTION (Gunicorn): Start background training thread
+            print("✓ Production mode detected - training will start in background")
+            import threading
+            training_thread = threading.Thread(target=train_in_background, daemon=True)
+            training_thread.start()
         else:
-            print("✗ OpenCV LBPH not available")
+            # LOCAL: Train immediately
+            print("✓ Local mode - training at startup")
+            if FACE_MODULE_AVAILABLE:
+                load_face_recognizer()
+            else:
+                print("✗ OpenCV LBPH not available")
     except Exception as e:
-        print(f"Startup error: {e}")
+        print(f"Startup warning: {e}")
         import traceback
         traceback.print_exc()
-        print("⚠ Will attempt to load recognizer on first recognition request")
 
 
 # Routes
