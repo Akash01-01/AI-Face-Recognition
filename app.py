@@ -242,33 +242,74 @@ def validate_face_quality(face_img, width, height):
     
     return True, "Quality OK"
 
-# Initialize application with training at startup
-with app.app_context():
-    db.create_all()
+# Smart initialization: avoid DB queries during Gunicorn startup to prevent connection issues
+face_recognizer_loaded = False
+
+def load_face_recognizer():
+    """Load and train face recognizer. Called at startup (local) or on first request (production)"""
+    global face_recognizer, label_to_emp, face_recognizer_loaded
+    
+    if face_recognizer_loaded:
+        return True
+    
     try:
-        print("Checking OpenCV face recognition...")
-        if FACE_MODULE_AVAILABLE:
-            print("✓ OpenCV LBPH (cv2.face) available")
-        else:
-            print("✗ OpenCV LBPH (cv2.face) NOT available - running in detection-only mode")
+        if not FACE_MODULE_AVAILABLE:
+            print("✗ OpenCV LBPH (cv2.face) NOT available")
+            face_recognizer_loaded = True
+            return False
 
         emp_count = EmpMaster.query.count()
         img_count = EmployeeImage.query.count()
         print(f"Found {emp_count} employees and {img_count} images in database")
 
-        if emp_count > 0 and face_cascade is not None and FACE_MODULE_AVAILABLE:
+        if emp_count > 0 and face_cascade is not None:
             print("Training face recognizer...")
             face_recognizer, label_to_emp = train_face_recognizer()
             print(f"✓ Trained with {len(label_to_emp)} employees")
+            face_recognizer_loaded = True
+            return True
         else:
             face_recognizer = None
             label_to_emp = {}
-            if face_cascade is None:
-                print("⚠ Face cascade not available - face detection disabled")
+            face_recognizer_loaded = True
+            return False
     except Exception as e:
-        print(f"Initialization error: {e}")
+        print(f"Face recognizer load error: {e}")
+        import traceback
+        traceback.print_exc()
         face_recognizer = None
         label_to_emp = {}
+        face_recognizer_loaded = True
+        return False
+
+# Initialize database tables (safe during startup)
+with app.app_context():
+    try:
+        db.create_all()
+        print("✓ Database tables ready")
+        
+        # Detect environment: Render uses PORT env var
+        is_production = os.environ.get('PORT') is not None or os.environ.get('RENDER') is not None
+        
+        if not is_production:
+            # LOCAL: Train at startup for immediate use
+            print("Local mode: Training at startup...")
+            if FACE_MODULE_AVAILABLE:
+                print("✓ OpenCV LBPH (cv2.face) available")
+                load_face_recognizer()
+            else:
+                print("✗ OpenCV LBPH not available")
+        else:
+            # PRODUCTION (Render): Skip training at startup to avoid MySQL timeout
+            print("Production mode: Will train on first recognition request")
+            if FACE_MODULE_AVAILABLE:
+                print("✓ OpenCV LBPH (cv2.face) available")
+            else:
+                print("✗ OpenCV LBPH not available")
+    except Exception as e:
+        print(f"Startup warning: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # Routes
@@ -425,10 +466,11 @@ def add_person():
 @app.route('/retrain')
 def force_retrain():
     """Force retrain face recognizer for production"""
-    global face_recognizer, label_to_emp
+    global face_recognizer, label_to_emp, face_recognizer_loaded
     try:
         old_count = len(label_to_emp)
-        face_recognizer, label_to_emp = train_face_recognizer()
+        face_recognizer_loaded = False  # Reset flag to allow reload
+        load_face_recognizer()
         return jsonify({
             'success': True,
             'message': f'Retrained: {old_count} -> {len(label_to_emp)} employees',
@@ -444,6 +486,11 @@ def force_retrain():
 @app.route('/identify', methods=['POST'])
 def identify():
     try:
+        # Lazy load recognizer on first request (for production deployment)
+        if not face_recognizer_loaded:
+            print("First recognition request - loading face recognizer...")
+            load_face_recognizer()
+        
         file = request.files.get('image')
         if file is None:
             return jsonify({'error': 'No image provided', 'recognized': False}), 400
