@@ -37,7 +37,11 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
     'pool_recycle': 280,
     'pool_timeout': 20,
-    'max_overflow': 0
+    'max_overflow': 0,
+    'connect_timeout': 10,
+    'read_timeout': 30,
+    'write_timeout': 30,
+    'pool_reset_on_return': 'rollback'
 }
 CORS(app)
 db = SQLAlchemy(app)
@@ -186,26 +190,42 @@ def train_face_recognizer():
     return recognizer, label_to_emp
 
 
-# Helper to get employee info
+# Helper to get employee info with retry logic for connection resilience
 def get_employee_info(emp_id):
-    emp = EmpMaster.query.filter_by(emp_id=emp_id).first()
-    if emp:
-        # Handle date properly - check if it's a date object and not empty string
-        dob_str = 'No DOB'
-        if emp.dob and hasattr(emp.dob, 'strftime'):
-            dob_str = emp.dob.strftime('%Y-%m-%d')
-        elif emp.dob and isinstance(emp.dob, str) and emp.dob.strip():
-            dob_str = emp.dob
-            
-        return {
-            'emp_id': emp.emp_id,
-            'id': emp.id,  # Integer ID for attendance table
-            'name': emp.full_name or emp.emp_id,
-            'email': emp.email or 'No email',
-            'phone': emp.contact or 'No phone',
-            'dob': dob_str
-        }
-    return {'emp_id': emp_id, 'id': None, 'name': 'Unknown', 'email': 'No email', 'phone': 'No phone', 'dob': 'No DOB'}
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            emp = EmpMaster.query.filter_by(emp_id=emp_id).first()
+            if emp:
+                # Handle date properly - check if it's a date object and not empty string
+                dob_str = 'No DOB'
+                if emp.dob and hasattr(emp.dob, 'strftime'):
+                    dob_str = emp.dob.strftime('%Y-%m-%d')
+                elif emp.dob and isinstance(emp.dob, str) and emp.dob.strip():
+                    dob_str = emp.dob
+                    
+                return {
+                    'emp_id': emp.emp_id,
+                    'id': emp.id,  # Integer ID for attendance table
+                    'name': emp.full_name or emp.emp_id,
+                    'email': emp.email or 'No email',
+                    'phone': emp.contact or 'No phone',
+                    'dob': dob_str
+                }
+            return {'emp_id': emp_id, 'id': None, 'name': 'Unknown', 'email': 'No email', 'phone': 'No phone', 'dob': 'No DOB'}
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"Database retry {attempt + 1} for employee info: {e}")
+                import time
+                time.sleep(0.5)
+                # Force new connection
+                try:
+                    db.session.remove()
+                except:
+                    pass
+            else:
+                print(f"Final database error for employee info: {e}")
+                return {'emp_id': emp_id, 'id': None, 'name': 'Database Error', 'email': 'No email', 'phone': 'No phone', 'dob': 'No DOB'}
 
 
 def reload_faces():
@@ -275,6 +295,11 @@ def load_face_recognizer():
                     print(f"Database connection attempt {attempt + 1} failed, retrying...")
                     import time
                     time.sleep(1)
+                    # Clear stale connections
+                    try:
+                        db.session.remove()
+                    except:
+                        pass
                 else:
                     raise db_err
 
@@ -622,30 +647,46 @@ def identify():
                 try:
                     emp_info = get_employee_info(emp_id)
                     
-                    # Quick attendance marking with error handling
+                    # Quick attendance marking with error handling and retry logic
                     try:
                         from datetime import datetime as dt, timezone
                         today = dt.now(timezone.utc).date()
                         current_time = dt.now(timezone.utc).time()
                         
                         if emp_info and emp_info.get('id'):
-                            # Ultra-fast attendance check
-                            existing = db.session.query(AttendanceMaster.id).filter_by(
-                                emp_id=emp_info['id'], 
-                                att_date=today
-                            ).first()
-                            if not existing:
-                                attendance = AttendanceMaster(
-                                    emp_id=emp_info['id'],
-                                    full_name=emp_info.get('name', 'Unknown'),
-                                    check_in=current_time,
-                                    att_date=today,
-                                    longitude='0.0',
-                                    latitude='0.0',
-                                    attendance_status='Present'
-                                )
-                                db.session.add(attendance)
-                                db.session.commit()
+                            # Retry attendance marking up to 3 times
+                            max_retries = 3
+                            for attempt in range(max_retries):
+                                try:
+                                    # Ultra-fast attendance check
+                                    existing = db.session.query(AttendanceMaster.id).filter_by(
+                                        emp_id=emp_info['id'], 
+                                        att_date=today
+                                    ).first()
+                                    if not existing:
+                                        attendance = AttendanceMaster(
+                                            emp_id=emp_info['id'],
+                                            full_name=emp_info.get('name', 'Unknown'),
+                                            check_in=current_time,
+                                            att_date=today,
+                                            longitude='0.0',
+                                            latitude='0.0',
+                                            attendance_status='Present'
+                                        )
+                                        db.session.add(attendance)
+                                        db.session.commit()
+                                        print(f'DEBUG: Attendance marked for {emp_id}')
+                                    else:
+                                        print(f'DEBUG: Attendance already marked for {emp_id} today')
+                                    break
+                                except Exception as db_err:
+                                    if attempt < max_retries - 1:
+                                        print(f"Attendance retry {attempt + 1}: {db_err}")
+                                        db.session.rollback()
+                                        import time
+                                        time.sleep(0.3)
+                                    else:
+                                        print(f"Attendance marking failed after retries: {db_err}")
                     except Exception as att_err:
                         print(f"Attendance marking error (non-critical): {att_err}")
                         # Continue even if attendance fails
