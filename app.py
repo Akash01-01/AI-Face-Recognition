@@ -46,6 +46,13 @@ db = SQLAlchemy(app)
 face_recognizer = None
 label_to_emp = {}
 
+# PRODUCTION SECURITY SETTINGS - Strict validation to prevent false positives
+STRICT_CONFIDENCE_THRESHOLD = 50  # LBPH: 0-50 excellent, 50-80 good, >80 reject
+MIN_FACE_WIDTH = 100  # Minimum face width in pixels
+MIN_FACE_HEIGHT = 100  # Minimum face height in pixels
+MIN_FACE_BRIGHTNESS = 40  # Minimum average brightness (0-255)
+MAX_FACE_BRIGHTNESS = 220  # Maximum average brightness to avoid overexposure
+
 # Detect availability of OpenCV's face module (LBPH)
 FACE_MODULE_AVAILABLE = bool(OPENCV_AVAILABLE and cv2 and hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create'))
 
@@ -147,7 +154,7 @@ def train_face_recognizer():
     label = 0
     for emp in employees:
         emp_faces_count = 0
-        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(2).all()  # Limit to 2 images per employee
+        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(10).all()  # Use up to 10 images per employee for better accuracy
         if not imgs:
             continue
         for img_row in imgs:
@@ -206,9 +213,34 @@ def reload_faces():
     face_recognizer, label_to_emp = train_face_recognizer()
 
 
-# Fast validation - just check confidence threshold
-def validate_confidence(confidence):
-    return confidence < 35  # Very strict confidence check only
+def validate_face_quality(face_img, width, height):
+    """
+    PRODUCTION VALIDATION: Multiple checks to prevent false positives
+    Returns: (is_valid, reason)
+    """
+    # Check 1: Minimum face size (reject blurry/distant faces)
+    if width < MIN_FACE_WIDTH or height < MIN_FACE_HEIGHT:
+        return False, f"Face too small ({width}x{height}). Move closer to camera."
+    
+    # Check 2: Face brightness (reject too dark/bright faces)
+    try:
+        avg_brightness = np.mean(face_img)
+        if avg_brightness < MIN_FACE_BRIGHTNESS:
+            return False, "Face too dark. Improve lighting."
+        if avg_brightness > MAX_FACE_BRIGHTNESS:
+            return False, "Face overexposed. Reduce lighting."
+    except Exception:
+        return False, "Cannot assess face quality."
+    
+    # Check 3: Face contrast (reject flat/washed out images)
+    try:
+        std_dev = np.std(face_img)
+        if std_dev < 15:  # Very low contrast
+            return False, "Poor image quality. Improve lighting contrast."
+    except Exception:
+        pass
+    
+    return True, "Quality OK"
 
 # Initialize application
 with app.app_context():
@@ -452,16 +484,29 @@ def identify():
                 'debug': 'cv2.face module not available; install opencv-contrib-python-headless'
             }), 503
 
-        # Single prediction only - no validation needed
+        # PRODUCTION SECURITY: Multi-layer validation
+        
+        # Layer 1: Face quality validation
+        is_valid, quality_msg = validate_face_quality(face_img, w, h)
+        if not is_valid:
+            return jsonify({
+                'recognized': False,
+                'message': f'Detection unsuccessful: {quality_msg}',
+                'debug': f'Face quality check failed: {quality_msg}'
+            }), 200
+        
+        # Layer 2: LBPH prediction
         label, confidence = face_recognizer.predict(face_img)
         
         # Debug info for production
-        print(f'DEBUG: Prediction - Label: {label}, Confidence: {confidence}')
+        print(f'DEBUG: Prediction - Label: {label}, Confidence: {confidence:.2f}, Threshold: {STRICT_CONFIDENCE_THRESHOLD}')
+        print(f'DEBUG: Face size: {w}x{h}, Quality: {quality_msg}')
         print(f'DEBUG: Available employees in label_to_emp: {list(label_to_emp.keys())}')
         
+        # Layer 3: Strict confidence threshold check
         best_face_crop = None
-        if confidence < 130:  # LBPH: lower is better, 30-80 excellent, <130 acceptable
-            # Quick face crop
+        if confidence < STRICT_CONFIDENCE_THRESHOLD:
+            # Face matched - prepare face crop for response
             try:
                 padding = 20
                 x1 = max(0, x - padding)
@@ -472,7 +517,8 @@ def identify():
             except Exception:
                 pass
 
-        if confidence < 130:  # LBPH: accept typical match range
+        # Layer 4: Final decision - STRICT threshold
+        if confidence < STRICT_CONFIDENCE_THRESHOLD:  # Production: Only accept excellent matches (0-50)
             emp_id = label_to_emp.get(label, None)
             print(f'DEBUG: Found emp_id: {emp_id} for label: {label}')
             if emp_id:
