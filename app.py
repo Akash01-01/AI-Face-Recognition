@@ -30,17 +30,14 @@ from flask_sqlalchemy import SQLAlchemy
 # Production configuration
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your_super_secret_key_here_change_in_production')
-# Database configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://u673831287_qa_attdb:p*NsybHiq0V@92.113.22.3/u673831287_qa_attdb'
+# Database configuration with PyMySQL connection timeouts
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://u673831287_qa_attdb:p*NsybHiq0V@92.113.22.3/u673831287_qa_attdb?connect_timeout=10&read_timeout=30&write_timeout=30'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
     'pool_recycle': 280,
     'pool_timeout': 20,
     'max_overflow': 0,
-    'connect_timeout': 10,
-    'read_timeout': 30,
-    'write_timeout': 30,
     'pool_reset_on_return': 'rollback'
 }
 CORS(app)
