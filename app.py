@@ -103,12 +103,13 @@ db = SQLAlchemy(app)
 # Cache for face recognizer
 face_recognizer = None
 label_to_emp = {}
+face_recognizer_loading = False  # Track if loading is in progress
 
-# PRODUCTION SECURITY SETTINGS - Memory Optimized Configuration
-# Try DeepFace first, fallback to LBPH if memory constrained
+# PRODUCTION SECURITY SETTINGS - High Accuracy Configuration
+# Use Facenet512 for best accuracy while maintaining reasonable memory usage
 USE_DEEPFACE = True  # Will auto-fallback to LBPH if memory issues
-DEEPFACE_DISTANCE_THRESHOLD = 0.6  # More lenient for lightweight model
-DEEPFACE_MODEL = 'OpenFace'  # Lightest model ~15MB vs VGG-Face 580MB
+DEEPFACE_DISTANCE_THRESHOLD = 0.45  # Optimal threshold for Facenet512 (stricter = better accuracy)
+DEEPFACE_MODEL = 'Facenet512'  # High accuracy model ~100MB (best balance of accuracy and size)
 DEEPFACE_DETECTOR = 'opencv'  # Lightweight detector
 LBPH_CONFIDENCE_THRESHOLD = 130  # LBPH fallback threshold
 MIN_FACE_WIDTH = 80   # Minimum face width in pixels
@@ -435,10 +436,18 @@ face_recognizer_loaded = False
 
 def load_face_recognizer():
     """Load and train face recognizer. Called at startup (local) or on first request (production)"""
-    global face_recognizer, label_to_emp, face_recognizer_loaded
+    global face_recognizer, label_to_emp, face_recognizer_loaded, face_recognizer_loading
     
-    if face_recognizer_loaded:
+    # If already loaded, return immediately
+    if face_recognizer_loaded and face_recognizer is not None:
         return True
+    
+    # Prevent concurrent loading attempts
+    if face_recognizer_loading:
+        print("⏳ Face recognizer loading already in progress...")
+        return False
+    
+    face_recognizer_loading = True
     
     try:
         # Check if we have any recognition capability
@@ -498,12 +507,14 @@ def load_face_recognizer():
                         print("🔧 Production: Memory cleanup after training")
                     
                     face_recognizer_loaded = True
+                    face_recognizer_loading = False
                     return True
                 else:
                     print("✗ Training failed - no recognizer or employees")
                     face_recognizer = None
                     label_to_emp = {}
                     face_recognizer_loaded = True
+                    face_recognizer_loading = False
                     return False
             except Exception as train_err:
                 print(f"✗ Training failed: {train_err}")
@@ -512,6 +523,7 @@ def load_face_recognizer():
                 face_recognizer = None
                 label_to_emp = {}
                 face_recognizer_loaded = True
+                face_recognizer_loading = False
                 return False
         else:
             print(f"✗ Cannot train: emp_count={emp_count}")
@@ -519,6 +531,7 @@ def load_face_recognizer():
             face_recognizer = None
             label_to_emp = {}
             face_recognizer_loaded = True
+            face_recognizer_loading = False
             return False
     except Exception as e:
         print(f"Face recognizer load error: {e}")
@@ -526,6 +539,7 @@ def load_face_recognizer():
         traceback.print_exc()
         face_recognizer = None
         label_to_emp = {}
+        face_recognizer_loading = False
         # Don't set loaded=True on error, allow retry on next request
         return False
 
@@ -579,6 +593,7 @@ with app.app_context():
         if IS_PRODUCTION or is_gunicorn:
             # PRODUCTION: Start background training thread to avoid startup timeout
             print("✓ Production mode detected - training will start in background")
+            print("🔧 Using Facenet512 model for high accuracy face recognition")
             print("🔧 This prevents Gunicorn/Render startup timeouts")
             import threading
             training_thread = threading.Thread(target=train_in_background, daemon=True)
@@ -586,6 +601,7 @@ with app.app_context():
         else:
             # LOCAL: Train immediately
             print("✓ Local mode - loading face templates at startup")
+            print(f"🔧 Using {DEEPFACE_MODEL} model for face recognition")
             if OPENCV_AVAILABLE:
                 load_face_recognizer()
             else:
@@ -909,8 +925,10 @@ def handle_deepface_recognition(file):
         
         # Debug info for production
         print(f'DEBUG: Best match - Employee: {best_match_emp_id}, Distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}')
+        print(f'DEBUG: Model: {DEEPFACE_MODEL}')
         
-        # Layer: Strict distance threshold check - PREVENT FALSE POSITIVES
+        # Strict distance threshold check - PREVENT FALSE POSITIVES
+        # Facenet512 has excellent accuracy with threshold 0.45
         if best_distance < DEEPFACE_DISTANCE_THRESHOLD and best_match_emp_id:
             try:
                 emp_info = get_employee_info(best_match_emp_id)
