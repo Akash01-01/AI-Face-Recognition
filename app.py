@@ -105,8 +105,17 @@ MIN_FACE_HEIGHT = 80  # Minimum face height in pixels
 MIN_FACE_BRIGHTNESS = 30  # Minimum average brightness (0-255)
 MAX_FACE_BRIGHTNESS = 230  # Maximum average brightness
 
-# Face recognition system availability - Always true with LBPH fallback
-FACE_MODULE_AVAILABLE = True  # Always available with LBPH fallback
+# Face recognition system availability - Check OpenCV face module
+try:
+    if OPENCV_AVAILABLE and cv2 and hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create'):
+        FACE_MODULE_AVAILABLE = True
+        print("✓ OpenCV face module available")
+    else:
+        FACE_MODULE_AVAILABLE = False
+        print("✗ OpenCV face module not available - will use fallback")
+except Exception as e:
+    FACE_MODULE_AVAILABLE = False
+    print(f"✗ Face module check failed: {e}")
 
 # Initialize face cascade with production error handling
 if OPENCV_AVAILABLE and cv2:
@@ -421,8 +430,12 @@ def load_face_recognizer():
         return True
     
     try:
-        if not FACE_MODULE_AVAILABLE:
-            print("✗ OpenCV LBPH (cv2.face) NOT available")
+        # Check if we have any recognition capability
+        has_lbph = OPENCV_AVAILABLE and cv2 and hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create')
+        can_load_deepface = True  # Will be tested during lazy loading
+        
+        if not has_lbph and not can_load_deepface:
+            print("✗ No face recognition modules available")
             face_recognizer_loaded = True
             return False
 
@@ -449,11 +462,26 @@ def load_face_recognizer():
 
         if emp_count > 0 and face_cascade is not None:
             print("Training face recognizer...")
-            face_recognizer, label_to_emp = train_face_recognizer()
-            print(f"✓ Trained with {len(label_to_emp)} employees")
-            face_recognizer_loaded = True
-            return True
+            try:
+                face_recognizer, label_to_emp = train_face_recognizer()
+                if face_recognizer is not None and len(label_to_emp) > 0:
+                    print(f"✓ Trained with {len(label_to_emp)} employees")
+                    face_recognizer_loaded = True
+                    return True
+                else:
+                    print("✗ Training failed - no recognizer or employees")
+                    face_recognizer = None
+                    label_to_emp = {}
+                    face_recognizer_loaded = True
+                    return False
+            except Exception as train_err:
+                print(f"✗ Training failed: {train_err}")
+                face_recognizer = None
+                label_to_emp = {}
+                face_recognizer_loaded = True
+                return False
         else:
+            print(f"✗ Cannot train: emp_count={emp_count}, face_cascade={face_cascade is not None}")
             face_recognizer = None
             label_to_emp = {}
             face_recognizer_loaded = True
@@ -740,130 +768,130 @@ def handle_deepface_recognition(file):
         if not lazy_load_deepface():
             raise Exception("DeepFace not available")
 
-            if not label_to_emp:
-                return jsonify({
-                    'recognized': False,
-                    'message': 'No employees registered yet.',
-                    'debug': f'embeddings_db empty: {len(face_recognizer) if face_recognizer else 0} employees'
-                })
-
-            # Generate embedding for the uploaded image
-            try:
-                query_embedding = DeepFace.represent(
-                    img_path=tmp_path,
-                    model_name=DEEPFACE_MODEL,
-                    detector_backend=DEEPFACE_DETECTOR,
-                    enforce_detection=True
-                )
-                
-                if not query_embedding or len(query_embedding) == 0:
-                    return jsonify({'message': 'No face detected in image.', 'recognized': False})
-                
-                query_vector = query_embedding[0]['embedding']
-                
-            except Exception as e:
-                print(f"DeepFace face detection failed: {e}")
-                return jsonify({'message': 'No clear face detected. Please ensure good lighting and face visibility.', 'recognized': False})
-
-            # Find best match among all employees
-            best_match_emp_id = None
-            best_distance = float('inf')
-            
-            print(f'DEBUG: Comparing against {len(face_recognizer)} employees')
-            
-            for emp_id, emp_embeddings in face_recognizer.items():
-                for emp_embedding in emp_embeddings:
-                    try:
-                        # Calculate cosine distance using numpy
-                        dot_product = np.dot(query_vector, emp_embedding)
-                        norm_a = np.linalg.norm(query_vector)
-                        norm_b = np.linalg.norm(emp_embedding)
-                        distance = 1 - (dot_product / (norm_a * norm_b))
-                        
-                        print(f'DEBUG: Distance to {emp_id}: {distance:.4f}')
-                        
-                        if distance < best_distance:
-                            best_distance = distance
-                            best_match_emp_id = emp_id
-                            
-                    except Exception as dist_err:
-                        print(f"Distance calculation error for {emp_id}: {dist_err}")
-                        continue
-            
-            # Debug info for production
-            print(f'DEBUG: Best match - Employee: {best_match_emp_id}, Distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}')
-            
-            # Layer: Strict distance threshold check - PREVENT FALSE POSITIVES
-            if best_distance < DEEPFACE_DISTANCE_THRESHOLD and best_match_emp_id:
-                try:
-                    emp_info = get_employee_info(best_match_emp_id)
-                    
-                    # Quick attendance marking with error handling and retry logic
-                    try:
-                        from datetime import datetime as dt, timezone
-                        today = dt.now(timezone.utc).date()
-                        current_time = dt.now(timezone.utc).time()
-                        
-                        if emp_info and emp_info.get('id'):
-                            # Retry attendance marking up to 3 times
-                            max_retries = 3
-                            for attempt in range(max_retries):
-                                try:
-                                    # Ultra-fast attendance check
-                                    existing = db.session.query(AttendanceMaster.id).filter_by(
-                                        emp_id=emp_info['id'], 
-                                        att_date=today
-                                    ).first()
-                                    if not existing:
-                                        attendance = AttendanceMaster(
-                                            emp_id=emp_info['id'],
-                                            full_name=emp_info.get('name', 'Unknown'),
-                                            check_in=current_time,
-                                            att_date=today,
-                                            longitude='0.0',
-                                            latitude='0.0',
-                                            attendance_status='Present'
-                                        )
-                                        db.session.add(attendance)
-                                        db.session.commit()
-                                        print(f'DEBUG: Attendance marked for {best_match_emp_id}')
-                                    else:
-                                        print(f'DEBUG: Attendance already marked for {best_match_emp_id} today')
-                                    break
-                                except Exception as db_err:
-                                    if attempt < max_retries - 1:
-                                        print(f"Attendance retry {attempt + 1}: {db_err}")
-                                        db.session.rollback()
-                                        import time
-                                        time.sleep(0.3)
-                                    else:
-                                        print(f"Attendance marking failed after retries: {db_err}")
-                    except Exception as att_err:
-                        print(f"Attendance marking error (non-critical): {att_err}")
-                        # Continue even if attendance fails
-                    
-                    return jsonify({
-                        'recognized': True,
-                        'emp_id': emp_info.get('emp_id', 'Unknown'),
-                        'name': emp_info.get('name', 'Unknown'),
-                        'email': emp_info.get('email', 'No email'),
-                        'phone': emp_info.get('phone', 'No phone'),
-                        'dob': emp_info.get('dob', 'No DOB'),
-                        'distance': float(best_distance),
-                        'message': f"Welcome {emp_info.get('name', 'User')}! Attendance marked."
-                    })
-                except Exception as emp_err:
-                    print(f"Employee info error: {emp_err}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # No valid match found - STRICT REJECTION TO PREVENT FALSE POSITIVES
-            print(f'DEBUG: No match found - Best distance {best_distance:.4f} exceeds threshold {DEEPFACE_DISTANCE_THRESHOLD}')
+        if not label_to_emp:
             return jsonify({
                 'recognized': False,
-                'message': 'Face not recognized. Please ensure you are registered in the system.',
-                'debug': f'Best distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}'
+                'message': 'No employees registered yet.',
+                'debug': f'embeddings_db empty: {len(face_recognizer) if face_recognizer else 0} employees'
             })
+
+        # Generate embedding for the uploaded image
+        try:
+            query_embedding = DeepFace.represent(
+                img_path=tmp_path,
+                model_name=DEEPFACE_MODEL,
+                detector_backend=DEEPFACE_DETECTOR,
+                enforce_detection=True
+            )
+                
+            if not query_embedding or len(query_embedding) == 0:
+                return jsonify({'message': 'No face detected in image.', 'recognized': False})
+            
+            query_vector = query_embedding[0]['embedding']
+                
+        except Exception as e:
+            print(f"DeepFace face detection failed: {e}")
+            return jsonify({'message': 'No clear face detected. Please ensure good lighting and face visibility.', 'recognized': False})
+
+        # Find best match among all employees
+        best_match_emp_id = None
+        best_distance = float('inf')
+        
+        print(f'DEBUG: Comparing against {len(face_recognizer)} employees')
+        
+        for emp_id, emp_embeddings in face_recognizer.items():
+            for emp_embedding in emp_embeddings:
+                try:
+                    # Calculate cosine distance using numpy
+                    dot_product = np.dot(query_vector, emp_embedding)
+                    norm_a = np.linalg.norm(query_vector)
+                    norm_b = np.linalg.norm(emp_embedding)
+                    distance = 1 - (dot_product / (norm_a * norm_b))
+                    
+                    print(f'DEBUG: Distance to {emp_id}: {distance:.4f}')
+                    
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_match_emp_id = emp_id
+                        
+                except Exception as dist_err:
+                    print(f"Distance calculation error for {emp_id}: {dist_err}")
+                    continue
+        
+        # Debug info for production
+        print(f'DEBUG: Best match - Employee: {best_match_emp_id}, Distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}')
+        
+        # Layer: Strict distance threshold check - PREVENT FALSE POSITIVES
+        if best_distance < DEEPFACE_DISTANCE_THRESHOLD and best_match_emp_id:
+            try:
+                emp_info = get_employee_info(best_match_emp_id)
+                
+                # Quick attendance marking with error handling and retry logic
+                try:
+                    from datetime import datetime as dt, timezone
+                    today = dt.now(timezone.utc).date()
+                    current_time = dt.now(timezone.utc).time()
+                    
+                    if emp_info and emp_info.get('id'):
+                        # Retry attendance marking up to 3 times
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                # Ultra-fast attendance check
+                                existing = db.session.query(AttendanceMaster.id).filter_by(
+                                    emp_id=emp_info['id'], 
+                                    att_date=today
+                                ).first()
+                                if not existing:
+                                    attendance = AttendanceMaster(
+                                        emp_id=emp_info['id'],
+                                        full_name=emp_info.get('name', 'Unknown'),
+                                        check_in=current_time,
+                                        att_date=today,
+                                        longitude='0.0',
+                                        latitude='0.0',
+                                        attendance_status='Present'
+                                    )
+                                    db.session.add(attendance)
+                                    db.session.commit()
+                                    print(f'DEBUG: Attendance marked for {best_match_emp_id}')
+                                else:
+                                    print(f'DEBUG: Attendance already marked for {best_match_emp_id} today')
+                                break
+                            except Exception as db_err:
+                                if attempt < max_retries - 1:
+                                    print(f"Attendance retry {attempt + 1}: {db_err}")
+                                    db.session.rollback()
+                                    import time
+                                    time.sleep(0.3)
+                                else:
+                                    print(f"Attendance marking failed after retries: {db_err}")
+                except Exception as att_err:
+                    print(f"Attendance marking error (non-critical): {att_err}")
+                    # Continue even if attendance fails
+                
+                return jsonify({
+                    'recognized': True,
+                    'emp_id': emp_info.get('emp_id', 'Unknown'),
+                    'name': emp_info.get('name', 'Unknown'),
+                    'email': emp_info.get('email', 'No email'),
+                    'phone': emp_info.get('phone', 'No phone'),
+                    'dob': emp_info.get('dob', 'No DOB'),
+                    'distance': float(best_distance),
+                    'message': f"Welcome {emp_info.get('name', 'User')}! Attendance marked."
+                })
+            except Exception as emp_err:
+                print(f"Employee info error: {emp_err}")
+                import traceback
+                traceback.print_exc()
+        
+        # No valid match found - STRICT REJECTION TO PREVENT FALSE POSITIVES
+        print(f'DEBUG: No match found - Best distance {best_distance:.4f} exceeds threshold {DEEPFACE_DISTANCE_THRESHOLD}')
+        return jsonify({
+            'recognized': False,
+            'message': 'Face not recognized. Please ensure you are registered in the system.',
+            'debug': f'Best distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}'
+        })
             
     except Exception as e:
         import traceback
