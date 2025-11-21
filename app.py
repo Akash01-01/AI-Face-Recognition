@@ -479,12 +479,17 @@ def load_face_recognizer():
                     print(f"✗ Database connection failed after {max_retries} attempts: {db_err}")
                     raise db_err
 
-        if emp_count > 0 and face_cascade is not None:
+        if emp_count > 0:
             print("Training face recognizer...")
+            print(f"🔧 Face cascade available: {face_cascade is not None}")
+            print(f"🔧 OpenCV available: {OPENCV_AVAILABLE}")
+            print(f"🔧 DeepFace enabled: {USE_DEEPFACE}")
+            
             try:
                 face_recognizer, label_to_emp = train_face_recognizer()
                 if face_recognizer is not None and len(label_to_emp) > 0:
                     print(f"✓ Trained with {len(label_to_emp)} employees")
+                    print(f"✓ Recognizer type: {type(face_recognizer).__name__ if not isinstance(face_recognizer, dict) else 'DeepFace'}")
                     
                     # Production memory cleanup
                     if IS_PRODUCTION:
@@ -502,12 +507,15 @@ def load_face_recognizer():
                     return False
             except Exception as train_err:
                 print(f"✗ Training failed: {train_err}")
+                import traceback
+                traceback.print_exc()
                 face_recognizer = None
                 label_to_emp = {}
                 face_recognizer_loaded = True
                 return False
         else:
-            print(f"✗ Cannot train: emp_count={emp_count}, face_cascade={face_cascade is not None}")
+            print(f"✗ Cannot train: emp_count={emp_count}")
+            print("✗ No employees found in database")
             face_recognizer = None
             label_to_emp = {}
             face_recognizer_loaded = True
@@ -525,17 +533,36 @@ def load_face_recognizer():
 def train_in_background():
     """Load face templates in background thread after app is fully started"""
     import time
-    time.sleep(2)  # Wait for app to fully start
+    time.sleep(3)  # Wait for app to fully start and database to be ready
     with app.app_context():
         try:
-            print("Background template loading started...")
-            if OPENCV_AVAILABLE:
-                load_face_recognizer()
-                print("✓ Background template loading complete")
-            else:
-                print("✗ OpenCV not available for template loading")
+            print("🔧 Background template loading started...")
+            print(f"🔧 Production mode: {IS_PRODUCTION}")
+            print(f"🔧 OpenCV available: {OPENCV_AVAILABLE}")
+            
+            # Try loading multiple times in production
+            max_attempts = 3 if IS_PRODUCTION else 1
+            for attempt in range(max_attempts):
+                try:
+                    print(f"🔧 Loading attempt {attempt + 1}/{max_attempts}...")
+                    success = load_face_recognizer()
+                    if success:
+                        print(f"✓ Background template loading complete (attempt {attempt + 1})")
+                        return
+                    else:
+                        print(f"⚠️ Loading attempt {attempt + 1} returned False")
+                        if attempt < max_attempts - 1:
+                            time.sleep(2)
+                except Exception as attempt_err:
+                    print(f"⚠️ Loading attempt {attempt + 1} error: {attempt_err}")
+                    if attempt < max_attempts - 1:
+                        time.sleep(2)
+                    else:
+                        raise
+            
+            print("✗ Background template loading failed after all attempts")
         except Exception as e:
-            print(f"Background template loading error: {e}")
+            print(f"✗ Background template loading error: {e}")
             import traceback
             traceback.print_exc()
 
@@ -770,11 +797,23 @@ def identify():
                 if IS_PRODUCTION:
                     error_msg += ' The system may still be initializing - please try again in a few moments.'
                 
+                # Debug information for troubleshooting
+                debug_info = {
+                    'face_recognizer_loaded': face_recognizer_loaded,
+                    'face_recognizer_is_none': face_recognizer is None,
+                    'opencv_available': OPENCV_AVAILABLE,
+                    'face_module_available': FACE_MODULE_AVAILABLE,
+                    'deepface_enabled': USE_DEEPFACE,
+                    'production_mode': IS_PRODUCTION
+                }
+                
+                print(f"🚨 Face recognition unavailable. Debug info: {debug_info}")
+                
                 return jsonify({
                     'recognized': False,
                     'message': error_msg,
                     'error': 'Face recognizer not loaded',
-                    'production_mode': IS_PRODUCTION
+                    'debug': debug_info if not IS_PRODUCTION else None
                 }), 503
         
         file = request.files.get('image')
