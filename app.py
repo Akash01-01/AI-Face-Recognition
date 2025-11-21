@@ -108,9 +108,10 @@ face_recognizer_loading = False  # Track if loading is in progress
 # PRODUCTION SECURITY SETTINGS - High Accuracy Configuration
 # Use Facenet512 for best accuracy while maintaining reasonable memory usage
 USE_DEEPFACE = True  # Will auto-fallback to LBPH if memory issues
-DEEPFACE_DISTANCE_THRESHOLD = 0.45  # Optimal threshold for Facenet512 (stricter = better accuracy)
+DEEPFACE_DISTANCE_THRESHOLD = 0.30  # STRICT threshold for Facenet512 to prevent false positives (0.30 = very strict)
 DEEPFACE_MODEL = 'Facenet512'  # High accuracy model ~100MB (best balance of accuracy and size)
 DEEPFACE_DETECTOR = 'opencv'  # Lightweight detector
+MIN_MATCH_CONFIDENCE = 2  # Require at least 2 face embeddings to match before accepting
 LBPH_CONFIDENCE_THRESHOLD = 130  # LBPH fallback threshold
 MIN_FACE_WIDTH = 80   # Minimum face width in pixels
 MIN_FACE_HEIGHT = 80  # Minimum face height in pixels
@@ -245,8 +246,8 @@ def train_deepface_optimized():
     
     for emp in employees:
         emp_faces_count = 0
-        # Limit to only 2 images per employee for memory efficiency
-        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(2).all()
+        # Use 3 images per employee for better consensus validation (was 2)
+        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(3).all()
         if not imgs:
             continue
             
@@ -898,13 +899,16 @@ def handle_deepface_recognition(file):
             print(f"DeepFace face detection failed: {e}")
             return jsonify({'message': 'No clear face detected. Please ensure good lighting and face visibility.', 'recognized': False})
 
-        # Find best match among all employees
+        # Find best match among all employees with STRICT validation
         best_match_emp_id = None
         best_distance = float('inf')
+        employee_matches = {}  # Track all matches per employee for consensus validation
         
         print(f'DEBUG: Comparing against {len(face_recognizer)} employees')
         
         for emp_id, emp_embeddings in face_recognizer.items():
+            employee_distances = []
+            
             for emp_embedding in emp_embeddings:
                 try:
                     # Calculate cosine distance using numpy
@@ -913,6 +917,7 @@ def handle_deepface_recognition(file):
                     norm_b = np.linalg.norm(emp_embedding)
                     distance = 1 - (dot_product / (norm_a * norm_b))
                     
+                    employee_distances.append(distance)
                     print(f'DEBUG: Distance to {emp_id}: {distance:.4f}')
                     
                     if distance < best_distance:
@@ -922,83 +927,124 @@ def handle_deepface_recognition(file):
                 except Exception as dist_err:
                     print(f"Distance calculation error for {emp_id}: {dist_err}")
                     continue
+            
+            # Store match statistics for this employee
+            if employee_distances:
+                matches_under_threshold = sum(1 for d in employee_distances if d < DEEPFACE_DISTANCE_THRESHOLD)
+                employee_matches[emp_id] = {
+                    'min_distance': min(employee_distances),
+                    'avg_distance': sum(employee_distances) / len(employee_distances),
+                    'matches_count': matches_under_threshold,
+                    'total_embeddings': len(employee_distances)
+                }
         
         # Debug info for production
         print(f'DEBUG: Best match - Employee: {best_match_emp_id}, Distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}')
         print(f'DEBUG: Model: {DEEPFACE_MODEL}')
+        print(f'DEBUG: All employee matches: {employee_matches}')
         
-        # Strict distance threshold check - PREVENT FALSE POSITIVES
-        # Facenet512 has excellent accuracy with threshold 0.45
-        if best_distance < DEEPFACE_DISTANCE_THRESHOLD and best_match_emp_id:
-            try:
-                emp_info = get_employee_info(best_match_emp_id)
-                
-                # Quick attendance marking with error handling and retry logic
+        # MULTI-LAYER VALIDATION - PREVENT FALSE POSITIVES
+        # Layer 1: Distance must be below strict threshold
+        # Layer 2: Multiple embeddings must match (consensus validation)
+        # Layer 3: Average distance must also be acceptable
+        
+        if best_match_emp_id and best_match_emp_id in employee_matches:
+            match_stats = employee_matches[best_match_emp_id]
+            
+            # Validation checks
+            distance_ok = best_distance < DEEPFACE_DISTANCE_THRESHOLD
+            consensus_ok = match_stats['matches_count'] >= MIN_MATCH_CONFIDENCE
+            avg_distance_ok = match_stats['avg_distance'] < (DEEPFACE_DISTANCE_THRESHOLD + 0.05)
+            
+            print(f'DEBUG: Validation - Distance OK: {distance_ok}, Consensus OK: {consensus_ok} ({match_stats["matches_count"]}/{MIN_MATCH_CONFIDENCE}), Avg Distance OK: {avg_distance_ok}')
+            
+            # ALL validation layers must pass
+            if distance_ok and consensus_ok and avg_distance_ok:
                 try:
-                    from datetime import datetime as dt, timezone
-                    today = dt.now(timezone.utc).date()
-                    current_time = dt.now(timezone.utc).time()
+                    emp_info = get_employee_info(best_match_emp_id)
                     
-                    if emp_info and emp_info.get('id'):
-                        # Retry attendance marking up to 3 times
-                        max_retries = 3
-                        for attempt in range(max_retries):
-                            try:
-                                # Ultra-fast attendance check
-                                existing = db.session.query(AttendanceMaster.id).filter_by(
-                                    emp_id=emp_info['id'], 
-                                    att_date=today
-                                ).first()
-                                if not existing:
-                                    attendance = AttendanceMaster(
-                                        emp_id=emp_info['id'],
-                                        full_name=emp_info.get('name', 'Unknown'),
-                                        check_in=current_time,
-                                        att_date=today,
-                                        longitude='0.0',
-                                        latitude='0.0',
-                                        attendance_status='Present'
-                                    )
-                                    db.session.add(attendance)
-                                    db.session.commit()
-                                    print(f'DEBUG: Attendance marked for {best_match_emp_id}')
-                                else:
-                                    print(f'DEBUG: Attendance already marked for {best_match_emp_id} today')
-                                break
-                            except Exception as db_err:
-                                if attempt < max_retries - 1:
-                                    print(f"Attendance retry {attempt + 1}: {db_err}")
-                                    db.session.rollback()
-                                    import time
-                                    time.sleep(0.3)
-                                else:
-                                    print(f"Attendance marking failed after retries: {db_err}")
-                except Exception as att_err:
-                    print(f"Attendance marking error (non-critical): {att_err}")
-                    # Continue even if attendance fails
+                    # Quick attendance marking with error handling and retry logic
+                    try:
+                        from datetime import datetime as dt, timezone
+                        today = dt.now(timezone.utc).date()
+                        current_time = dt.now(timezone.utc).time()
+                        
+                        if emp_info and emp_info.get('id'):
+                            # Retry attendance marking up to 3 times
+                            max_retries = 3
+                            for attempt in range(max_retries):
+                                try:
+                                    # Ultra-fast attendance check
+                                    existing = db.session.query(AttendanceMaster.id).filter_by(
+                                        emp_id=emp_info['id'], 
+                                        att_date=today
+                                    ).first()
+                                    if not existing:
+                                        attendance = AttendanceMaster(
+                                            emp_id=emp_info['id'],
+                                            full_name=emp_info.get('name', 'Unknown'),
+                                            check_in=current_time,
+                                            att_date=today,
+                                            longitude='0.0',
+                                            latitude='0.0',
+                                            attendance_status='Present'
+                                        )
+                                        db.session.add(attendance)
+                                        db.session.commit()
+                                        print(f'DEBUG: Attendance marked for {best_match_emp_id}')
+                                    else:
+                                        print(f'DEBUG: Attendance already marked for {best_match_emp_id} today')
+                                    break
+                                except Exception as db_err:
+                                    if attempt < max_retries - 1:
+                                        print(f"Attendance retry {attempt + 1}: {db_err}")
+                                        db.session.rollback()
+                                        import time
+                                        time.sleep(0.3)
+                                    else:
+                                        print(f"Attendance marking failed after retries: {db_err}")
+                    except Exception as att_err:
+                        print(f"Attendance marking error (non-critical): {att_err}")
+                        # Continue even if attendance fails
+                    
+                    return jsonify({
+                        'recognized': True,
+                        'emp_id': emp_info.get('emp_id', 'Unknown'),
+                        'name': emp_info.get('name', 'Unknown'),
+                        'email': emp_info.get('email', 'No email'),
+                        'phone': emp_info.get('phone', 'No phone'),
+                        'dob': emp_info.get('dob', 'No DOB'),
+                        'distance': float(best_distance),
+                        'message': f"Welcome {emp_info.get('name', 'User')}! Attendance marked."
+                    })
+                except Exception as emp_err:
+                    print(f"Employee info error: {emp_err}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                # No valid match found - STRICT REJECTION TO PREVENT FALSE POSITIVES
+                rejection_reason = 'Unknown'
+                if not best_match_emp_id:
+                    rejection_reason = 'No employee embeddings matched'
+                elif best_distance >= DEEPFACE_DISTANCE_THRESHOLD:
+                    rejection_reason = f'Distance too high: {best_distance:.4f} >= {DEEPFACE_DISTANCE_THRESHOLD}'
+                elif best_match_emp_id in employee_matches:
+                    match_stats = employee_matches[best_match_emp_id]
+                    if match_stats['matches_count'] < MIN_MATCH_CONFIDENCE:
+                        rejection_reason = f'Insufficient consensus: {match_stats["matches_count"]}/{MIN_MATCH_CONFIDENCE} embeddings matched'
+                    elif match_stats['avg_distance'] >= (DEEPFACE_DISTANCE_THRESHOLD + 0.05):
+                        rejection_reason = f'Average distance too high: {match_stats["avg_distance"]:.4f}'
+                
+                print(f'DEBUG: REJECTED - {rejection_reason}')
+                print(f'DEBUG: Best distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}')
                 
                 return jsonify({
-                    'recognized': True,
-                    'emp_id': emp_info.get('emp_id', 'Unknown'),
-                    'name': emp_info.get('name', 'Unknown'),
-                    'email': emp_info.get('email', 'No email'),
-                    'phone': emp_info.get('phone', 'No phone'),
-                    'dob': emp_info.get('dob', 'No DOB'),
-                    'distance': float(best_distance),
-                    'message': f"Welcome {emp_info.get('name', 'User')}! Attendance marked."
+                    'recognized': False,
+                    'message': 'Face not recognized. Please ensure you are registered in the system.',
+                    'reason': rejection_reason,
+                    'best_distance': float(best_distance),
+                    'threshold': DEEPFACE_DISTANCE_THRESHOLD
                 })
-            except Exception as emp_err:
-                print(f"Employee info error: {emp_err}")
-                import traceback
-                traceback.print_exc()
-        
-        # No valid match found - STRICT REJECTION TO PREVENT FALSE POSITIVES
-        print(f'DEBUG: No match found - Best distance {best_distance:.4f} exceeds threshold {DEEPFACE_DISTANCE_THRESHOLD}')
-        return jsonify({
-            'recognized': False,
-            'message': 'Face not recognized. Please ensure you are registered in the system.',
-            'debug': f'Best distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}'
-        })
             
     except Exception as e:
         import traceback
