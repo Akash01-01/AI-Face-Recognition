@@ -72,6 +72,17 @@ import tempfile
 import io
 from PIL import Image
 import json
+import sys
+
+# Environment and deployment detection
+IS_PRODUCTION = os.getenv('RENDER') == 'true' or os.getenv('RAILWAY_ENVIRONMENT') == 'production' or os.getenv('VERCEL') == '1'
+LOCAL_MODE = not IS_PRODUCTION
+PORT = int(os.getenv('PORT', 5000))
+
+print(f"🔧 Running in {'PRODUCTION' if IS_PRODUCTION else 'LOCAL'} mode")
+print(f"🔧 Port: {PORT}")
+print(f"🔧 Python version: {sys.version}")
+print(f"🔧 Available memory info: {'Limited (production)' if IS_PRODUCTION else 'Local development'}")
 
 # Production configuration
 app = Flask(__name__)
@@ -439,8 +450,14 @@ def load_face_recognizer():
             face_recognizer_loaded = True
             return False
 
+        # Production memory optimization
+        if IS_PRODUCTION:
+            print("🔧 Production mode: Applying memory optimizations...")
+            import gc
+            gc.collect()  # Clean up before database operations
+        
         # Retry logic for database connection (especially for first request on Render)
-        max_retries = 3
+        max_retries = 5 if IS_PRODUCTION else 3  # More retries in production
         for attempt in range(max_retries):
             try:
                 emp_count = EmpMaster.query.count()
@@ -449,15 +466,17 @@ def load_face_recognizer():
                 break
             except Exception as db_err:
                 if attempt < max_retries - 1:
-                    print(f"Database connection attempt {attempt + 1} failed, retrying...")
+                    wait_time = 2 if IS_PRODUCTION else 1  # Longer wait in production
+                    print(f"Database connection attempt {attempt + 1} failed, retrying in {wait_time}s...")
                     import time
-                    time.sleep(1)
+                    time.sleep(wait_time)
                     # Clear stale connections
                     try:
                         db.session.remove()
                     except:
                         pass
                 else:
+                    print(f"✗ Database connection failed after {max_retries} attempts: {db_err}")
                     raise db_err
 
         if emp_count > 0 and face_cascade is not None:
@@ -466,6 +485,13 @@ def load_face_recognizer():
                 face_recognizer, label_to_emp = train_face_recognizer()
                 if face_recognizer is not None and len(label_to_emp) > 0:
                     print(f"✓ Trained with {len(label_to_emp)} employees")
+                    
+                    # Production memory cleanup
+                    if IS_PRODUCTION:
+                        import gc
+                        gc.collect()  # Clean up after training
+                        print("🔧 Production: Memory cleanup after training")
+                    
                     face_recognizer_loaded = True
                     return True
                 else:
@@ -523,9 +549,10 @@ with app.app_context():
         import sys
         is_gunicorn = "gunicorn" in sys.argv[0] if sys.argv else False
         
-        if is_gunicorn:
-            # PRODUCTION (Gunicorn): Start background training thread
+        if IS_PRODUCTION or is_gunicorn:
+            # PRODUCTION: Start background training thread to avoid startup timeout
             print("✓ Production mode detected - training will start in background")
+            print("🔧 This prevents Gunicorn/Render startup timeouts")
             import threading
             training_thread = threading.Thread(target=train_in_background, daemon=True)
             training_thread.start()
@@ -716,15 +743,38 @@ def force_retrain():
 @app.route('/identify', methods=['POST'])
 def identify():
     try:
-        # Safety check: If recognizer failed at startup, try loading now
+        # Safety check: If recognizer failed at startup, try loading now (critical for production)
         if not face_recognizer_loaded or face_recognizer is None:
-            print("Face recognizer not loaded at startup - attempting to load now...")
-            success = load_face_recognizer()
+            print(f"Face recognizer not loaded at startup - attempting to load now... (Production: {IS_PRODUCTION})")
+            
+            # In production, try multiple times as the system might still be initializing
+            max_load_attempts = 3 if IS_PRODUCTION else 1
+            success = False
+            
+            for attempt in range(max_load_attempts):
+                try:
+                    success = load_face_recognizer()
+                    if success and face_recognizer is not None:
+                        break
+                    elif IS_PRODUCTION and attempt < max_load_attempts - 1:
+                        print(f"Production: Load attempt {attempt + 1} failed, retrying...")
+                        import time
+                        time.sleep(2)  # Wait before retry in production
+                except Exception as load_err:
+                    print(f"Load attempt {attempt + 1} error: {load_err}")
+                    if attempt == max_load_attempts - 1:
+                        break
+            
             if not success or face_recognizer is None:
+                error_msg = 'Face recognition system is unavailable. Please ensure employees are registered.'
+                if IS_PRODUCTION:
+                    error_msg += ' The system may still be initializing - please try again in a few moments.'
+                
                 return jsonify({
                     'recognized': False,
-                    'message': 'Face recognition system is unavailable. Please ensure employees are registered.',
-                    'error': 'Face recognizer not loaded'
+                    'message': error_msg,
+                    'error': 'Face recognizer not loaded',
+                    'production_mode': IS_PRODUCTION
                 }), 503
         
         file = request.files.get('image')
@@ -1057,6 +1107,17 @@ def mark_attendance_and_respond(emp_id, score, score_type):
 
 # Production configuration
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('FLASK_ENV') == 'development'
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    print(f"🚀 Starting Flask app on port {PORT}")
+    print(f"🔧 Production mode: {IS_PRODUCTION}")
+    print(f"🔧 Face recognition loaded: {face_recognizer_loaded}")
+    
+    # Production deployment configuration
+    debug = os.environ.get('FLASK_ENV') == 'development' and not IS_PRODUCTION
+    
+    app.run(
+        host='0.0.0.0', 
+        port=PORT,
+        debug=debug,
+        threaded=True,  # Enable threading for better performance
+        use_reloader=False  # Disable reloader in production
+    )
