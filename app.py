@@ -24,16 +24,32 @@ except ImportError as e:
         def array(*args, **kwargs): return []
     np = MockNumpy()
 
-# Import DeepFace for better accuracy
+# Import DeepFace for better accuracy with memory optimization
 try:
-    from deepface import DeepFace
     import tensorflow as tf
-    # Suppress TensorFlow warnings
+    # Optimize TensorFlow for low memory usage
     tf.get_logger().setLevel('ERROR')
+    import os
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+    os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN for lower memory
+    
+    # Configure TensorFlow for memory efficiency
+    try:
+        physical_devices = tf.config.experimental.list_physical_devices('GPU')
+        if len(physical_devices) > 0:
+            tf.config.experimental.set_memory_growth(physical_devices[0], True)
+    except:
+        pass  # Ignore GPU config errors on CPU-only systems
+    
+    from deepface import DeepFace
     DEEPFACE_AVAILABLE = True
     print("✓ DeepFace imported successfully")
 except ImportError as e:
     print(f"✗ DeepFace import failed: {e}")
+    DEEPFACE_AVAILABLE = False
+    DeepFace = None
+except Exception as e:
+    print(f"✗ TensorFlow optimization failed: {e}")
     DEEPFACE_AVAILABLE = False
     DeepFace = None
 
@@ -65,10 +81,10 @@ db = SQLAlchemy(app)
 face_recognizer = None
 label_to_emp = {}
 
-# PRODUCTION SECURITY SETTINGS - DeepFace Configuration
-DEEPFACE_DISTANCE_THRESHOLD = 0.4  # DeepFace: Lower is better, typical 0.3-0.6
-DEEPFACE_MODEL = 'VGG-Face'  # Options: VGG-Face, Facenet, OpenFace, DeepFace, DeepID, ArcFace
-DEEPFACE_DETECTOR = 'opencv'  # Options: opencv, retinaface, mtcnn, ssd, dlib
+# PRODUCTION SECURITY SETTINGS - DeepFace Configuration (Memory Optimized)
+DEEPFACE_DISTANCE_THRESHOLD = 0.5  # DeepFace: Lower is better, relaxed for lighter model
+DEEPFACE_MODEL = 'OpenFace'  # Lightweight model: OpenFace (~30MB vs VGG-Face 580MB)
+DEEPFACE_DETECTOR = 'opencv'  # Lightweight detector
 MIN_FACE_WIDTH = 80   # Minimum face width in pixels
 MIN_FACE_HEIGHT = 80  # Minimum face height in pixels
 MIN_FACE_BRIGHTNESS = 30  # Minimum average brightness (0-255)
@@ -162,7 +178,7 @@ class AttendanceMaster(db.Model):
 
 # Train recognizer using new employee tables
 def prepare_deepface_embeddings():
-    """Prepare face embeddings database for DeepFace recognition"""
+    """Prepare face embeddings database for DeepFace recognition (Memory Optimized)"""
     if not FACE_MODULE_AVAILABLE:
         print("DeepFace not available - skipping embedding preparation")
         return None, {}
@@ -176,7 +192,8 @@ def prepare_deepface_embeddings():
     
     for emp in employees:
         emp_faces_count = 0
-        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(5).all()  # Use up to 5 high-quality images
+        # Limit to 3 images max for memory efficiency
+        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(3).all()
         if not imgs:
             continue
             
@@ -189,17 +206,21 @@ def prepare_deepface_embeddings():
                     tmp_path = tmp_file.name
                 
                 try:
-                    # Generate embedding using DeepFace
+                    # Generate embedding using lightweight DeepFace model
                     embedding = DeepFace.represent(
                         img_path=tmp_path,
-                        model_name=DEEPFACE_MODEL,
+                        model_name=DEEPFACE_MODEL,  # OpenFace - lightweight
                         detector_backend=DEEPFACE_DETECTOR,
-                        enforce_detection=True
+                        enforce_detection=False  # More lenient for memory constrained environments
                     )
                     
                     if embedding and len(embedding) > 0:
                         emp_embeddings.append(embedding[0]['embedding'])
                         emp_faces_count += 1
+                        
+                        # Memory cleanup after each embedding
+                        import gc
+                        gc.collect()
                         
                 except Exception as e:
                     print(f"DeepFace embedding failed for {emp.emp_id}: {e}")
@@ -221,6 +242,51 @@ def prepare_deepface_embeddings():
             print(f"✓ Processed {emp_faces_count} faces for employee {emp.emp_id}")
     
     return embeddings_db, emp_id_mapping
+
+
+def train_lbph_fallback():
+    """Fallback LBPH training for memory-constrained environments"""
+    try:
+        recognizer = cv2.face.LBPHFaceRecognizer_create()
+        faces = []
+        labels = []
+        label_to_emp = {}
+        employees = EmpMaster.query.all()
+        if not employees:
+            return recognizer, label_to_emp
+        label = 0
+        for emp in employees:
+            emp_faces_count = 0
+            imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(5).all()
+            if not imgs:
+                continue
+            for img_row in imgs:
+                try:
+                    npbuf = np.frombuffer(img_row.image_data, dtype=np.uint8)
+                    img = cv2.imdecode(npbuf, cv2.IMREAD_GRAYSCALE)
+                    if img is None:
+                        continue
+                    if face_cascade is None:
+                        continue
+                    detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.3, minNeighbors=2, minSize=(30, 30))
+                    if len(detected_faces) > 0:
+                        x, y, w, h = max(detected_faces, key=lambda f: f[2] * f[3])
+                        face_roi = img[y:y+h, x:x+w]
+                        face_roi = cv2.resize(face_roi, (80, 80))
+                        faces.append(face_roi)
+                        labels.append(label)
+                        emp_faces_count += 1
+                except Exception:
+                    continue
+            if emp_faces_count > 0:
+                label_to_emp[label] = emp.emp_id
+                label += 1
+        if faces and labels and recognizer is not None:
+            recognizer.train(faces, np.array(labels))
+        return recognizer, label_to_emp
+    except Exception as e:
+        print(f"LBPH fallback training failed: {e}")
+        return None, {}
 
 
 # Helper to get employee info with retry logic for connection resilience
@@ -265,8 +331,7 @@ def reload_faces():
     global face_recognizer, label_to_emp, face_recognizer_loaded
     print("Retraining face recognizer with updated data...")
     face_recognizer_loaded = False  # Reset flag to allow reload
-    face_recognizer, label_to_emp = train_face_recognizer()
-    face_recognizer_loaded = True  # Mark as loaded after successful training
+    success = load_face_recognizer()  # Use the main load function with fallback logic
     print(f"✓ Retrained with {len(label_to_emp)} employees")
 
 
@@ -338,10 +403,34 @@ def load_face_recognizer():
 
         if emp_count > 0 and face_cascade is not None:
             print("Training face recognizer...")
-            face_recognizer, label_to_emp = prepare_deepface_embeddings()
-            print(f"✓ Trained with {len(label_to_emp)} employees")
-            face_recognizer_loaded = True
-            return True
+            try:
+                # Try DeepFace first (memory optimized)
+                face_recognizer, label_to_emp = prepare_deepface_embeddings()
+                if face_recognizer and len(label_to_emp) > 0:
+                    print(f"✓ DeepFace trained with {len(label_to_emp)} employees")
+                    face_recognizer_loaded = True
+                    return True
+                else:
+                    raise Exception("DeepFace training failed - insufficient memory or no embeddings generated")
+            except Exception as deepface_err:
+                print(f"DeepFace training failed: {deepface_err}")
+                print("⚠️ Falling back to LBPH face recognition due to memory constraints")
+                
+                # Fallback to LBPH for memory-constrained environments
+                try:
+                    if hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create'):
+                        face_recognizer, label_to_emp = train_lbph_fallback()
+                        if face_recognizer and len(label_to_emp) > 0:
+                            print(f"✓ LBPH fallback trained with {len(label_to_emp)} employees")
+                            face_recognizer_loaded = True
+                            return True
+                except Exception as lbph_err:
+                    print(f"LBPH fallback also failed: {lbph_err}")
+                
+                face_recognizer = None
+                label_to_emp = {}
+                face_recognizer_loaded = True
+                return False
         else:
             face_recognizer = None
             label_to_emp = {}
@@ -577,177 +666,292 @@ def force_retrain():
 @app.route('/identify', methods=['POST'])
 def identify():
     try:
-        # Safety check: If embeddings failed at startup, try loading now
+        # Safety check: If recognizer failed at startup, try loading now
         if not face_recognizer_loaded or face_recognizer is None:
-            print("DeepFace embeddings not loaded at startup - attempting to load now...")
+            print("Face recognizer not loaded at startup - attempting to load now...")
             success = load_face_recognizer()
             if not success or face_recognizer is None:
                 return jsonify({
                     'recognized': False,
                     'message': 'Face recognition system is unavailable. Please ensure employees are registered.',
-                    'error': 'DeepFace embeddings not loaded'
+                    'error': 'Face recognizer not loaded'
                 }), 503
         
         file = request.files.get('image')
         if file is None:
             return jsonify({'error': 'No image provided', 'recognized': False}), 400
 
-        # Save uploaded image to temporary file for DeepFace
-        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
-            file.seek(0)  # Reset file pointer
-            tmp_file.write(file.read())
-            tmp_path = tmp_file.name
-
-        try:
-            # Check if DeepFace is available
-            if not FACE_MODULE_AVAILABLE:
-                return jsonify({
-                    'recognized': False,
-                    'message': 'DeepFace service unavailable',
-                    'debug': f'DeepFace available: {DEEPFACE_AVAILABLE}'
-                }), 503
-
-            if not label_to_emp:
-                return jsonify({
-                    'recognized': False,
-                    'message': 'No employees registered yet.',
-                    'debug': f'embeddings_db empty: {len(face_recognizer) if face_recognizer else 0} employees'
-                })
-
-            # Generate embedding for the uploaded image
-            try:
-                query_embedding = DeepFace.represent(
-                    img_path=tmp_path,
-                    model_name=DEEPFACE_MODEL,
-                    detector_backend=DEEPFACE_DETECTOR,
-                    enforce_detection=True
-                )
-                
-                if not query_embedding or len(query_embedding) == 0:
-                    return jsonify({'message': 'No face detected in image.', 'recognized': False})
-                
-                query_vector = query_embedding[0]['embedding']
-                
-            except Exception as e:
-                print(f"DeepFace face detection failed: {e}")
-                return jsonify({'message': 'No clear face detected. Please ensure good lighting and face visibility.', 'recognized': False})
-
-            # Find best match among all employees
-            best_match_emp_id = None
-            best_distance = float('inf')
-            
-            print(f'DEBUG: Comparing against {len(face_recognizer)} employees')
-            
-            for emp_id, emp_embeddings in face_recognizer.items():
-                for emp_embedding in emp_embeddings:
-                    try:
-                        # Calculate cosine distance using numpy
-                        dot_product = np.dot(query_vector, emp_embedding)
-                        norm_a = np.linalg.norm(query_vector)
-                        norm_b = np.linalg.norm(emp_embedding)
-                        distance = 1 - (dot_product / (norm_a * norm_b))
-                        
-                        print(f'DEBUG: Distance to {emp_id}: {distance:.4f}')
-                        
-                        if distance < best_distance:
-                            best_distance = distance
-                            best_match_emp_id = emp_id
-                            
-                    except Exception as dist_err:
-                        print(f"Distance calculation error for {emp_id}: {dist_err}")
-                        continue
-            
-            # Debug info for production
-            print(f'DEBUG: Best match - Employee: {best_match_emp_id}, Distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}')
-            
-            # Layer: Strict distance threshold check - PREVENT FALSE POSITIVES
-            if best_distance < DEEPFACE_DISTANCE_THRESHOLD and best_match_emp_id:
-                try:
-                    emp_info = get_employee_info(best_match_emp_id)
-                    
-                    # Quick attendance marking with error handling and retry logic
-                    try:
-                        from datetime import datetime as dt, timezone
-                        today = dt.now(timezone.utc).date()
-                        current_time = dt.now(timezone.utc).time()
-                        
-                        if emp_info and emp_info.get('id'):
-                            # Retry attendance marking up to 3 times
-                            max_retries = 3
-                            for attempt in range(max_retries):
-                                try:
-                                    # Ultra-fast attendance check
-                                    existing = db.session.query(AttendanceMaster.id).filter_by(
-                                        emp_id=emp_info['id'], 
-                                        att_date=today
-                                    ).first()
-                                    if not existing:
-                                        attendance = AttendanceMaster(
-                                            emp_id=emp_info['id'],
-                                            full_name=emp_info.get('name', 'Unknown'),
-                                            check_in=current_time,
-                                            att_date=today,
-                                            longitude='0.0',
-                                            latitude='0.0',
-                                            attendance_status='Present'
-                                        )
-                                        db.session.add(attendance)
-                                        db.session.commit()
-                                        print(f'DEBUG: Attendance marked for {best_match_emp_id}')
-                                    else:
-                                        print(f'DEBUG: Attendance already marked for {best_match_emp_id} today')
-                                    break
-                                except Exception as db_err:
-                                    if attempt < max_retries - 1:
-                                        print(f"Attendance retry {attempt + 1}: {db_err}")
-                                        db.session.rollback()
-                                        import time
-                                        time.sleep(0.3)
-                                    else:
-                                        print(f"Attendance marking failed after retries: {db_err}")
-                    except Exception as att_err:
-                        print(f"Attendance marking error (non-critical): {att_err}")
-                        # Continue even if attendance fails
-                    
-                    return jsonify({
-                        'recognized': True,
-                        'emp_id': emp_info.get('emp_id', 'Unknown'),
-                        'name': emp_info.get('name', 'Unknown'),
-                        'email': emp_info.get('email', 'No email'),
-                        'phone': emp_info.get('phone', 'No phone'),
-                        'dob': emp_info.get('dob', 'No DOB'),
-                        'distance': float(best_distance),
-                        'message': f"Welcome {emp_info.get('name', 'User')}! Attendance marked."
-                    })
-                except Exception as emp_err:
-                    print(f"Employee info error: {emp_err}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # No valid match found - STRICT REJECTION TO PREVENT FALSE POSITIVES
-            print(f'DEBUG: No match found - Best distance {best_distance:.4f} exceeds threshold {DEEPFACE_DISTANCE_THRESHOLD}')
+        if not label_to_emp:
             return jsonify({
                 'recognized': False,
-                'message': 'Face not recognized. Please ensure you are registered in the system.',
-                'debug': f'Best distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}'
+                'message': 'No employees registered yet.',
+                'debug': f'No trained employees'
             })
+
+        # Detect if we're using DeepFace or LBPH fallback
+        using_deepface = isinstance(face_recognizer, dict)
+        
+        if using_deepface:
+            # DeepFace Recognition Path
+            return handle_deepface_recognition(file)
+        else:
+            # LBPH Fallback Recognition Path  
+            return handle_lbph_recognition(file)
             
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(tmp_path)
-            except:
-                pass
-                
     except Exception as e:
         import traceback
-        print('Error in /identify:', e)
+        print('Error in identify route:', e)
         traceback.print_exc()
         return jsonify({
             'recognized': False,
             'message': 'Internal server error. Please try again.',
             'error': str(e)
         }), 500
+
+def handle_deepface_recognition(file):
+    """Handle DeepFace recognition for memory-available environments"""
+    # Save uploaded image to temporary file for DeepFace
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+        file.seek(0)  # Reset file pointer
+        tmp_file.write(file.read())
+        tmp_path = tmp_file.name
+
+    try:
+        if not FACE_MODULE_AVAILABLE:
+            return jsonify({
+                'recognized': False,
+                'message': 'DeepFace service unavailable',
+                'debug': f'DeepFace available: {DEEPFACE_AVAILABLE}'
+            }), 503
+
+        # Generate embedding for the uploaded image
+        try:
+            query_embedding = DeepFace.represent(
+                img_path=tmp_path,
+                model_name=DEEPFACE_MODEL,
+                detector_backend=DEEPFACE_DETECTOR,
+                enforce_detection=False  # More lenient for production
+            )
+            
+            if not query_embedding or len(query_embedding) == 0:
+                return jsonify({'message': 'No face detected in image.', 'recognized': False})
+            
+            query_vector = query_embedding[0]['embedding']
+            
+        except Exception as e:
+            print(f"DeepFace face detection failed: {e}")
+            return jsonify({'message': 'No clear face detected. Please ensure good lighting and face visibility.', 'recognized': False})
+
+        # Find best match among all employees
+        best_match_emp_id = None
+        best_distance = float('inf')
+        
+        print(f'DEBUG: Comparing against {len(face_recognizer)} employees')
+        
+        for emp_id, emp_embeddings in face_recognizer.items():
+            for emp_embedding in emp_embeddings:
+                try:
+                    # Calculate cosine distance using numpy
+                    dot_product = np.dot(query_vector, emp_embedding)
+                    norm_a = np.linalg.norm(query_vector)
+                    norm_b = np.linalg.norm(emp_embedding)
+                    distance = 1 - (dot_product / (norm_a * norm_b))
+                    
+                    print(f'DEBUG: Distance to {emp_id}: {distance:.4f}')
+                    
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_match_emp_id = emp_id
+                        
+                except Exception as dist_err:
+                    print(f"Distance calculation error for {emp_id}: {dist_err}")
+                    continue
+        
+        # Debug info for production
+        print(f'DEBUG: Best match - Employee: {best_match_emp_id}, Distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}')
+        
+        # Layer: Strict distance threshold check - PREVENT FALSE POSITIVES
+        if best_distance < DEEPFACE_DISTANCE_THRESHOLD and best_match_emp_id:
+            return mark_attendance_and_respond(best_match_emp_id, best_distance, 'distance')
+        
+        # No valid match found - STRICT REJECTION TO PREVENT FALSE POSITIVES
+        print(f'DEBUG: No match found - Best distance {best_distance:.4f} exceeds threshold {DEEPFACE_DISTANCE_THRESHOLD}')
+        return jsonify({
+            'recognized': False,
+            'message': 'Face not recognized. Please ensure you are registered in the system.',
+            'debug': f'Best distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}'
+        })
+        
+    except Exception as e:
+        import traceback
+        print('Error in DeepFace recognition:', e)
+        traceback.print_exc()
+        return jsonify({
+            'recognized': False,
+            'message': 'Internal server error. Please try again.',
+            'error': str(e)
+        }), 500
+    finally:
+        # Clean up temporary file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+def handle_lbph_recognition(file):
+    """Handle LBPH recognition fallback for memory-constrained environments"""
+    try:
+        img = np.frombuffer(file.read(), np.uint8)
+        frame = cv2.imdecode(img, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify({'error': 'Invalid image', 'recognized': False}), 400
+
+        # Resize frame for faster processing
+        height, width = frame.shape[:2]
+        if height > 400:
+            scale = 400.0 / height
+            new_width = int(width * scale)
+            frame = cv2.resize(frame, (new_width, 400))
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        if not OPENCV_AVAILABLE or face_cascade is None:
+            return jsonify({
+                'recognized': False,
+                'message': 'Face detection service unavailable'
+            })
+        
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=3, minSize=(50, 50))
+        if len(faces) == 0:
+            return jsonify({'message': 'No face detected.', 'recognized': False})
+
+        # Use only the largest face
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        face_img = gray[y:y+h, x:x+w]
+        face_img = cv2.resize(face_img, (80, 80))
+
+        if face_recognizer is None:
+            return jsonify({
+                'recognized': False,
+                'message': 'Face recognition temporarily unavailable on server.'
+            }), 503
+
+        # Face quality validation
+        is_valid, quality_msg = validate_face_quality(face_img, w, h)
+        if not is_valid:
+            return jsonify({
+                'recognized': False,
+                'message': f'Detection unsuccessful: {quality_msg}'
+            })
+        
+        # LBPH prediction
+        label, confidence = face_recognizer.predict(face_img)
+        
+        print(f'DEBUG: LBPH - Label: {label}, Confidence: {confidence:.2f}, Threshold: 130')
+        
+        # LBPH uses inverted confidence (lower is better)
+        if confidence < 130:  # Good match
+            emp_id = label_to_emp.get(label, None)
+            if emp_id:
+                return mark_attendance_and_respond(emp_id, confidence, 'confidence')
+        
+        return jsonify({
+            'recognized': False,
+            'message': 'Face not recognized. Please ensure you are registered in the system.',
+            'debug': f'LBPH confidence: {confidence:.2f}, Threshold: 130'
+        })
+        
+    except Exception as e:
+        import traceback
+        print('Error in LBPH recognition:', e)
+        traceback.print_exc()
+        return jsonify({
+            'recognized': False,
+            'message': 'Internal server error. Please try again.',
+            'error': str(e)
+        }), 500
+
+
+def mark_attendance_and_respond(emp_id, score, score_type):
+    """Common function to mark attendance and return response"""
+    try:
+        emp_info = get_employee_info(emp_id)
+        
+        # Quick attendance marking with error handling and retry logic
+        try:
+            from datetime import datetime as dt, timezone
+            today = dt.now(timezone.utc).date()
+            current_time = dt.now(timezone.utc).time()
+            
+            if emp_info and emp_info.get('id'):
+                # Retry attendance marking up to 3 times
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        # Ultra-fast attendance check
+                        existing = db.session.query(AttendanceMaster.id).filter_by(
+                            emp_id=emp_info['id'], 
+                            att_date=today
+                        ).first()
+                        if not existing:
+                            attendance = AttendanceMaster(
+                                emp_id=emp_info['id'],
+                                full_name=emp_info.get('name', 'Unknown'),
+                                check_in=current_time,
+                                att_date=today,
+                                longitude='0.0',
+                                latitude='0.0',
+                                attendance_status='Present'
+                            )
+                            db.session.add(attendance)
+                            db.session.commit()
+                            print(f'DEBUG: Attendance marked for {emp_id}')
+                        else:
+                            print(f'DEBUG: Attendance already marked for {emp_id} today')
+                        break
+                    except Exception as db_err:
+                        if attempt < max_retries - 1:
+                            print(f"Attendance retry {attempt + 1}: {db_err}")
+                            db.session.rollback()
+                            import time
+                            time.sleep(0.3)
+                        else:
+                            print(f"Attendance marking failed after retries: {db_err}")
+        except Exception as att_err:
+            print(f"Attendance marking error (non-critical): {att_err}")
+            # Continue even if attendance fails
+        
+        response_data = {
+            'recognized': True,
+            'emp_id': emp_info.get('emp_id', 'Unknown'),
+            'name': emp_info.get('name', 'Unknown'),
+            'email': emp_info.get('email', 'No email'),
+            'phone': emp_info.get('phone', 'No phone'),
+            'dob': emp_info.get('dob', 'No DOB'),
+            'message': f"Welcome {emp_info.get('name', 'User')}! Attendance marked."
+        }
+        
+        # Add score based on type
+        if score_type == 'distance':
+            response_data['distance'] = float(score)
+        else:
+            response_data['confidence'] = float(score)
+            
+        return jsonify(response_data)
+        
+    except Exception as emp_err:
+        print(f"Employee info error: {emp_err}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'recognized': False,
+            'message': 'Employee information retrieval failed.',
+            'error': str(emp_err)
+        }), 500
+
+
+# Production configuration
 
 
 # Production configuration
