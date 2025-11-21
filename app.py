@@ -23,9 +23,27 @@ except ImportError as e:
         @staticmethod
         def array(*args, **kwargs): return []
     np = MockNumpy()
+
+# Import DeepFace for better accuracy
+try:
+    from deepface import DeepFace
+    import tensorflow as tf
+    # Suppress TensorFlow warnings
+    tf.get_logger().setLevel('ERROR')
+    DEEPFACE_AVAILABLE = True
+    print("✓ DeepFace imported successfully")
+except ImportError as e:
+    print(f"✗ DeepFace import failed: {e}")
+    DEEPFACE_AVAILABLE = False
+    DeepFace = None
+
 import base64
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
+import tempfile
+import io
+from PIL import Image
+import json
 
 # Production configuration
 app = Flask(__name__)
@@ -47,15 +65,17 @@ db = SQLAlchemy(app)
 face_recognizer = None
 label_to_emp = {}
 
-# PRODUCTION SECURITY SETTINGS - Tuned for your dataset
-STRICT_CONFIDENCE_THRESHOLD = 130  # LBPH: Lower is better, accept <130 based on your data (typical: 115-130)
+# PRODUCTION SECURITY SETTINGS - DeepFace Configuration
+DEEPFACE_DISTANCE_THRESHOLD = 0.4  # DeepFace: Lower is better, typical 0.3-0.6
+DEEPFACE_MODEL = 'VGG-Face'  # Options: VGG-Face, Facenet, OpenFace, DeepFace, DeepID, ArcFace
+DEEPFACE_DETECTOR = 'opencv'  # Options: opencv, retinaface, mtcnn, ssd, dlib
 MIN_FACE_WIDTH = 80   # Minimum face width in pixels
 MIN_FACE_HEIGHT = 80  # Minimum face height in pixels
 MIN_FACE_BRIGHTNESS = 30  # Minimum average brightness (0-255)
 MAX_FACE_BRIGHTNESS = 230  # Maximum average brightness
 
-# Detect availability of OpenCV's face module (LBPH)
-FACE_MODULE_AVAILABLE = bool(OPENCV_AVAILABLE and cv2 and hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create'))
+# Face recognition system availability
+FACE_MODULE_AVAILABLE = DEEPFACE_AVAILABLE
 
 # Initialize face cascade with production error handling
 if OPENCV_AVAILABLE and cv2:
@@ -141,50 +161,66 @@ class AttendanceMaster(db.Model):
 
 
 # Train recognizer using new employee tables
-def train_face_recognizer():
+def prepare_deepface_embeddings():
+    """Prepare face embeddings database for DeepFace recognition"""
     if not FACE_MODULE_AVAILABLE:
-        print("LBPH module not available - skipping training")
+        print("DeepFace not available - skipping embedding preparation")
         return None, {}
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    faces = []
-    labels = []
-    label_to_emp = {}
+    
+    embeddings_db = {}
     employees = EmpMaster.query.all()
     if not employees:
-        return recognizer, label_to_emp
-    label = 0
+        return embeddings_db, {}
+    
+    emp_id_mapping = {}
+    
     for emp in employees:
         emp_faces_count = 0
-        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(10).all()  # Use up to 10 images per employee for better accuracy
+        imgs = EmployeeImage.query.filter_by(emp_id=emp.emp_id).limit(5).all()  # Use up to 5 high-quality images
         if not imgs:
             continue
+            
+        emp_embeddings = []
         for img_row in imgs:
             try:
-                npbuf = np.frombuffer(img_row.image_data, dtype=np.uint8)
-                img = cv2.imdecode(npbuf, cv2.IMREAD_GRAYSCALE)
-                if img is None:
+                # Save image to temporary file for DeepFace
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+                    tmp_file.write(img_row.image_data)
+                    tmp_path = tmp_file.name
+                
+                try:
+                    # Generate embedding using DeepFace
+                    embedding = DeepFace.represent(
+                        img_path=tmp_path,
+                        model_name=DEEPFACE_MODEL,
+                        detector_backend=DEEPFACE_DETECTOR,
+                        enforce_detection=True
+                    )
+                    
+                    if embedding and len(embedding) > 0:
+                        emp_embeddings.append(embedding[0]['embedding'])
+                        emp_faces_count += 1
+                        
+                except Exception as e:
+                    print(f"DeepFace embedding failed for {emp.emp_id}: {e}")
                     continue
-                # Skip if cascade not available
-                if face_cascade is None:
-                    print("Skipping face detection in training - cascade not available")
-                    continue
-                detected_faces = face_cascade.detectMultiScale(img, scaleFactor=1.3, minNeighbors=2, minSize=(30, 30))
-                if len(detected_faces) > 0:
-                    # Use only the largest face
-                    x, y, w, h = max(detected_faces, key=lambda f: f[2] * f[3])
-                    face_roi = img[y:y+h, x:x+w]
-                    face_roi = cv2.resize(face_roi, (80, 80))  # Even smaller for speed
-                    faces.append(face_roi)
-                    labels.append(label)
-                    emp_faces_count += 1
-            except Exception:
+                finally:
+                    # Clean up temporary file
+                    try:
+                        os.unlink(tmp_path)
+                    except:
+                        pass
+                        
+            except Exception as e:
+                print(f"Image processing failed for {emp.emp_id}: {e}")
                 continue
+        
         if emp_faces_count > 0:
-            label_to_emp[label] = emp.emp_id  # Store string emp_id
-            label += 1
-    if faces and labels and recognizer is not None:
-        recognizer.train(faces, np.array(labels))
-    return recognizer, label_to_emp
+            embeddings_db[emp.emp_id] = emp_embeddings
+            emp_id_mapping[emp.emp_id] = emp.emp_id
+            print(f"✓ Processed {emp_faces_count} faces for employee {emp.emp_id}")
+    
+    return embeddings_db, emp_id_mapping
 
 
 # Helper to get employee info with retry logic for connection resilience
@@ -302,7 +338,7 @@ def load_face_recognizer():
 
         if emp_count > 0 and face_cascade is not None:
             print("Training face recognizer...")
-            face_recognizer, label_to_emp = train_face_recognizer()
+            face_recognizer, label_to_emp = prepare_deepface_embeddings()
             print(f"✓ Trained with {len(label_to_emp)} employees")
             face_recognizer_loaded = True
             return True
@@ -396,7 +432,7 @@ def debug_info():
             'face_recognizer_loaded': face_recognizer is not None,
             'trained_labels': len(label_to_emp),
             'label_mapping': label_to_emp,
-            'confidence_threshold': STRICT_CONFIDENCE_THRESHOLD,
+            'distance_threshold': DEEPFACE_DISTANCE_THRESHOLD,
             'face_cascade_loaded': face_cascade is not None and (not hasattr(face_cascade, 'empty') or not face_cascade.empty()),
             'python_version': f"{__import__('sys').version_info.major}.{__import__('sys').version_info.minor}.{__import__('sys').version_info.micro}"
         })
@@ -541,108 +577,93 @@ def force_retrain():
 @app.route('/identify', methods=['POST'])
 def identify():
     try:
-        # Safety check: If recognizer failed at startup, try loading now
+        # Safety check: If embeddings failed at startup, try loading now
         if not face_recognizer_loaded or face_recognizer is None:
-            print("Recognizer not loaded at startup - attempting to load now...")
+            print("DeepFace embeddings not loaded at startup - attempting to load now...")
             success = load_face_recognizer()
             if not success or face_recognizer is None:
                 return jsonify({
                     'recognized': False,
                     'message': 'Face recognition system is unavailable. Please ensure employees are registered.',
-                    'error': 'Recognizer not loaded'
+                    'error': 'DeepFace embeddings not loaded'
                 }), 503
         
         file = request.files.get('image')
         if file is None:
             return jsonify({'error': 'No image provided', 'recognized': False}), 400
 
-        img = np.frombuffer(file.read(), np.uint8)
-        frame = cv2.imdecode(img, cv2.IMREAD_COLOR)
-        if frame is None:
-            return jsonify({'error': 'Invalid image', 'recognized': False}), 400
+        # Save uploaded image to temporary file for DeepFace
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+            file.seek(0)  # Reset file pointer
+            tmp_file.write(file.read())
+            tmp_path = tmp_file.name
 
-        # Resize frame for faster processing
-        height, width = frame.shape[:2]
-        if height > 400:
-            scale = 400.0 / height
-            new_width = int(width * scale)
-            frame = cv2.resize(frame, (new_width, 400))
+        try:
+            # Check if DeepFace is available
+            if not FACE_MODULE_AVAILABLE:
+                return jsonify({
+                    'recognized': False,
+                    'message': 'DeepFace service unavailable',
+                    'debug': f'DeepFace available: {DEEPFACE_AVAILABLE}'
+                }), 503
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Check if OpenCV and face cascade are available
-        if not OPENCV_AVAILABLE or face_cascade is None:
-            return jsonify({
-                'recognized': False,
-                'message': 'Face detection service unavailable',
-                'debug': f'OpenCV available: {OPENCV_AVAILABLE}, Cascade loaded: {face_cascade is not None}'
-            })
-        
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=3, minSize=(50, 50))
-        if len(faces) == 0:
-            return jsonify({'message': 'No face detected.', 'recognized': False})
+            if not label_to_emp:
+                return jsonify({
+                    'recognized': False,
+                    'message': 'No employees registered yet.',
+                    'debug': f'embeddings_db empty: {len(face_recognizer) if face_recognizer else 0} employees'
+                })
 
-        if not label_to_emp:
-            return jsonify({
-                'recognized': False,
-                'message': 'No employees registered yet.',
-                'debug': f'label_to_emp empty, face_recognizer: {face_recognizer is not None}'
-            })
-
-        # Use only the largest face for maximum speed
-        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-        
-        face_img = gray[y:y+h, x:x+w]
-        face_img = cv2.resize(face_img, (80, 80))  # Very small for speed
-
-        # Ensure recognizer is available
-        if face_recognizer is None:
-            return jsonify({
-                'recognized': False,
-                'message': 'Face recognition temporarily unavailable on server.',
-                'debug': 'cv2.face module not available; install opencv-contrib-python-headless'
-            }), 503
-
-        # PRODUCTION SECURITY: Multi-layer validation
-        
-        # Layer 1: Face quality validation
-        is_valid, quality_msg = validate_face_quality(face_img, w, h)
-        if not is_valid:
-            return jsonify({
-                'recognized': False,
-                'message': f'Detection unsuccessful: {quality_msg}',
-                'debug': f'Face quality check failed: {quality_msg}'
-            }), 200
-        
-        # Layer 2: LBPH prediction
-        label, confidence = face_recognizer.predict(face_img)
-        
-        # Debug info for production
-        print(f'DEBUG: Prediction - Label: {label}, Confidence: {confidence:.2f}, Threshold: {STRICT_CONFIDENCE_THRESHOLD}')
-        print(f'DEBUG: Face size: {w}x{h}, Quality: {quality_msg}')
-        print(f'DEBUG: Available employees in label_to_emp: {list(label_to_emp.keys())}')
-        
-        # Layer 3: Strict confidence threshold check
-        best_face_crop = None
-        if confidence < STRICT_CONFIDENCE_THRESHOLD:
-            # Face matched - prepare face crop for response
+            # Generate embedding for the uploaded image
             try:
-                padding = 20
-                x1 = max(0, x - padding)
-                y1 = max(0, y - padding)
-                x2 = min(frame.shape[1], x + w + padding)
-                y2 = min(frame.shape[0], y + h + padding)
-                best_face_crop = frame[y1:y2, x1:x2]
-            except Exception:
-                pass
+                query_embedding = DeepFace.represent(
+                    img_path=tmp_path,
+                    model_name=DEEPFACE_MODEL,
+                    detector_backend=DEEPFACE_DETECTOR,
+                    enforce_detection=True
+                )
+                
+                if not query_embedding or len(query_embedding) == 0:
+                    return jsonify({'message': 'No face detected in image.', 'recognized': False})
+                
+                query_vector = query_embedding[0]['embedding']
+                
+            except Exception as e:
+                print(f"DeepFace face detection failed: {e}")
+                return jsonify({'message': 'No clear face detected. Please ensure good lighting and face visibility.', 'recognized': False})
 
-        # Layer 4: Final decision - STRICT threshold
-        if confidence < STRICT_CONFIDENCE_THRESHOLD:  # Production: Only accept excellent matches
-            emp_id = label_to_emp.get(label, None)
-            print(f'DEBUG: Found emp_id: {emp_id} for label: {label}')
-            if emp_id:
+            # Find best match among all employees
+            best_match_emp_id = None
+            best_distance = float('inf')
+            
+            print(f'DEBUG: Comparing against {len(face_recognizer)} employees')
+            
+            for emp_id, emp_embeddings in face_recognizer.items():
+                for emp_embedding in emp_embeddings:
+                    try:
+                        # Calculate cosine distance using numpy
+                        dot_product = np.dot(query_vector, emp_embedding)
+                        norm_a = np.linalg.norm(query_vector)
+                        norm_b = np.linalg.norm(emp_embedding)
+                        distance = 1 - (dot_product / (norm_a * norm_b))
+                        
+                        print(f'DEBUG: Distance to {emp_id}: {distance:.4f}')
+                        
+                        if distance < best_distance:
+                            best_distance = distance
+                            best_match_emp_id = emp_id
+                            
+                    except Exception as dist_err:
+                        print(f"Distance calculation error for {emp_id}: {dist_err}")
+                        continue
+            
+            # Debug info for production
+            print(f'DEBUG: Best match - Employee: {best_match_emp_id}, Distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}')
+            
+            # Layer: Strict distance threshold check - PREVENT FALSE POSITIVES
+            if best_distance < DEEPFACE_DISTANCE_THRESHOLD and best_match_emp_id:
                 try:
-                    emp_info = get_employee_info(emp_id)
+                    emp_info = get_employee_info(best_match_emp_id)
                     
                     # Quick attendance marking with error handling and retry logic
                     try:
@@ -672,9 +693,9 @@ def identify():
                                         )
                                         db.session.add(attendance)
                                         db.session.commit()
-                                        print(f'DEBUG: Attendance marked for {emp_id}')
+                                        print(f'DEBUG: Attendance marked for {best_match_emp_id}')
                                     else:
-                                        print(f'DEBUG: Attendance already marked for {emp_id} today')
+                                        print(f'DEBUG: Attendance already marked for {best_match_emp_id} today')
                                     break
                                 except Exception as db_err:
                                     if attempt < max_retries - 1:
@@ -688,15 +709,6 @@ def identify():
                         print(f"Attendance marking error (non-critical): {att_err}")
                         # Continue even if attendance fails
                     
-                    # Prepare face image
-                    face_b64 = None
-                    if best_face_crop is not None:
-                        try:
-                            _, buf = cv2.imencode('.jpg', best_face_crop, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                            face_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-                        except Exception as img_err:
-                            print(f"Face image encoding error: {img_err}")
-                    
                     return jsonify({
                         'recognized': True,
                         'emp_id': emp_info.get('emp_id', 'Unknown'),
@@ -704,19 +716,29 @@ def identify():
                         'email': emp_info.get('email', 'No email'),
                         'phone': emp_info.get('phone', 'No phone'),
                         'dob': emp_info.get('dob', 'No DOB'),
-                        'confidence': float(confidence),
-                        'face_image': face_b64,
+                        'distance': float(best_distance),
                         'message': f"Welcome {emp_info.get('name', 'User')}! Attendance marked."
                     })
                 except Exception as emp_err:
                     print(f"Employee info error: {emp_err}")
                     import traceback
                     traceback.print_exc()
-        # No valid match found
-        return jsonify({
-            'recognized': False,
-            'message': 'Detection unsuccessful.'
-        })
+            
+            # No valid match found - STRICT REJECTION TO PREVENT FALSE POSITIVES
+            print(f'DEBUG: No match found - Best distance {best_distance:.4f} exceeds threshold {DEEPFACE_DISTANCE_THRESHOLD}')
+            return jsonify({
+                'recognized': False,
+                'message': 'Face not recognized. Please ensure you are registered in the system.',
+                'debug': f'Best distance: {best_distance:.4f}, Threshold: {DEEPFACE_DISTANCE_THRESHOLD}'
+            })
+            
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+                
     except Exception as e:
         import traceback
         print('Error in /identify:', e)
@@ -724,8 +746,7 @@ def identify():
         return jsonify({
             'recognized': False,
             'message': 'Internal server error. Please try again.',
-            'error': str(e),
-            'face_image': None
+            'error': str(e)
         }), 500
 
 
